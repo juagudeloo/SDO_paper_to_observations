@@ -36,29 +36,39 @@ class LightGlueMatcher:
         print(f"Extracting features for shapes: img0={img0_gray.shape}, img1={img1_gray.shape}")
         
         with torch.no_grad():
-            feats0 = self.disk(img0_t)
-            feats1 = self.disk(img1_t)
-            corr = self.matcher({'image0': feats0, 'image1': feats1})
+            # self.disk returns list of DISKFeatures
+            feats0 = self.disk(img0_t)[0]
+            feats1 = self.disk(img1_t)[0]
+            
+            desc1 = feats0.descriptors
+            desc2 = feats1.descriptors
+            
+            lafs1 = KF.laf_from_center_scale_ori(feats0.keypoints.unsqueeze(0))
+            lafs2 = KF.laf_from_center_scale_ori(feats1.keypoints.unsqueeze(0))
+
+            scores, idxs = self.matcher(
+                desc1, desc2, lafs1, lafs2, 
+                hw1=img0_gray.shape, hw2=img1_gray.shape
+            )
+
+        if len(scores) == 0:
+            print("No matches found by LightGlue.")
+            return np.empty((0, 1, 2)), np.empty((0, 1, 2)), np.empty((0,))
 
         # Coordinates assume padded sizes (if input images are already padded)
-        # Note: In the original notebook, there was un-padding scale logic. If we run RANSAC on the
-        # full padded matrices, we can just transform and keep within limits, or un-pad the coords.
         # Here we return coordinates relative to the input arrays img0_gray / img1_gray
-        
-        # Original coords are normalized by tensor shape for unpadding in the notebook, but if 
-        # img0_t and img0_gray match size, we just need to retrieve kpts.
-        # Kornia returns keypoints in [x, y] coordinates.
-        kpts0 = corr['keypoints0'][0].cpu().numpy()
-        kpts1 = corr['keypoints1'][0].cpu().numpy()
-        scores = corr['scores'][0].cpu().numpy()
+        scores = scores.cpu().numpy().flatten()
+        idxs = idxs.cpu().numpy()
 
         valid_mask = scores > self.conf_thresh
-        
-        # Apply mask and cap max matches for RANSAC speed
-        src_pts = kpts0[valid_mask][:self.max_matches].reshape(-1, 1, 2)
-        dst_pts = kpts1[valid_mask][:self.max_matches].reshape(-1, 1, 2)
-        
+        valid_idxs = idxs[valid_mask][:self.max_matches]
         valid_scores = scores[valid_mask][:self.max_matches]
+
+        kpts0 = feats0.keypoints.cpu().numpy()
+        kpts1 = feats1.keypoints.cpu().numpy()
+
+        src_pts = kpts0[valid_idxs[:, 0]].reshape(-1, 1, 2)
+        dst_pts = kpts1[valid_idxs[:, 1]].reshape(-1, 1, 2)
 
         print(f"LightGlue returned {len(src_pts)} valid matches (conf > {self.conf_thresh}).")
         

@@ -21,6 +21,7 @@ def run_pipeline(
     download_dir: str = "./data/sunpy_images/",
     conf_thresh: float = 0.1,
     show: bool = False,
+    downsample: float = 1.0,
 ):
     print("=== SDO Paper to Observation Pipeline ===")
     
@@ -36,6 +37,16 @@ def run_pipeline(
     paper_img_raw = io.imread(paper_image_path, as_gray=True)
     paper_gray = Preprocessor.preprocess_paper_image(paper_img_raw)
     
+    import cv2
+    if downsample != 1.0:
+        print(f"Downsampling images by a factor of {downsample} for faster testing...")
+        if len(original_raw.shape) >= 2:
+            new_h, new_w = int(original_raw.shape[0] * downsample), int(original_raw.shape[1] * downsample)
+            original_raw = cv2.resize(original_raw, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        if len(paper_gray.shape) >= 2:
+            new_h, new_w = int(paper_gray.shape[0] * downsample), int(paper_gray.shape[1] * downsample)
+            paper_gray = cv2.resize(paper_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
     # Pad images to multiple of 16 for DISK/LightGlue
     paper_padded = Preprocessor.pad_to_multiple16(paper_gray)
     original_padded = Preprocessor.pad_to_multiple16(original_raw)
@@ -77,6 +88,7 @@ if __name__ == "__main__":
     parser.add_argument("--outdir", type=str, default="./outputs", help="Output directory.")
     parser.add_argument("--conf", type=float, default=0.1, help="LightGlue confidence threshold.")
     parser.add_argument("--show", action="store_true", help="Display summary plot interactively.")
+    parser.add_argument("--downsample", type=float, default=1.0, help="Downsample ratio (e.g., 0.25) to speed up matching for testing.")
     
     args = parser.parse_args()
     
@@ -86,4 +98,5 @@ if __name__ == "__main__":
         output_dir=args.outdir,
         conf_thresh=args.conf,
         show=args.show,
+        downsample=args.downsample,
     )

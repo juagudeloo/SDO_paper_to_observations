@@ -1,0 +1,17 @@
+# Core Dependencies
+torch
+kornia
+
+# Image Processing & Computer Vision
+opencv-python
+numpy
+scikit-image
+matplotlib
+
+# Solar Physics & Astronomy
+sunpy[net,map]
+astropy
+
+# Utilities
+pathlib
+argparse

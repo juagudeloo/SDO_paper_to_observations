@@ -12,7 +12,9 @@ You can run the pipeline from the terminal using `python src/pipeline.py`. Below
 | :--- | :--- | :--- | :--- |
 | `--paper` | `str` | **Required** | Path to the image file extracted from the paper (e.g., `images/paper_image.png`). |
 | `--date` | `str` | **Required** | The target UTC date and time for the observation (e.g., `'2012-07-04T09:54:53Z'`). |
-| `--downsample` | `float` | `1.0` | **Scaling factor** to resize images before processing (e.g., `0.5` for half size). |
+| `--downsample` | `float` | `1.0` | **(deprecated)** uniform scaling factor applied to **both** images. Use the newer flags if you need fine-grained control. |
++| `--downsample-paper` | `float` | `1.0` | Downsample factor applied only to the paper image. |
++| `--downsample-original` | `float` | `1.0` | Downsample factor applied only to the HMI observation. |
 | `--conf` | `float` | `0.1` | Confidence threshold for the LightGlue matcher (0.0 to 1.0). |
 | `--outdir` | `str` | `./outputs` | Directory where results and visualizations will be saved. |
 | `--show` | `flag` | `False` | If included, displays the result summary window at the end of the run. |
@@ -23,13 +25,18 @@ You can run the pipeline from the terminal using `python src/pipeline.py`. Below
 
 SDO images are natively **4096 x 4096 pixels**. Extracting AI features (DISK) and matching them (LightGlue) on these full-resolution images is computationally expensive and slow (can take several minutes on CPU).
 
-The `--downsample` parameter allows you to perform **fast testing**:
-- **`--downsample 0.25`**: Resizes images to 25% of their size (1024x1024). This makes the pipeline **10x-20x faster**.
-- **`--downsample 0.5`**: A good balance between speed and feature matching accuracy.
-- **`--downsample 1.0`**: Uses full resolution. Recommended for the final "production" run to get the most precise alignment.
+The `--downsample` parameter historically allowed you to perform **fast testing** by shrinking both images. That behavior is still available for backwards compatibility, but you now have more control:
 
-> **Warning**: Using a value too low (like `0.1`) may result in the paper image becoming too small for the model to detect enough keypoints, leading to a "Too few points for RANSAC" error.
+- `--downsample-original 0.25`: downscales only the 4096×4096 HMI map to 1024×1024, greatly speeding up computation while leaving the paper scan untouched.
+- `--downsample-paper 0.5`: if your paper image is large (e.g. a full‑page scan), you can speed things up by shrinking it independently.
+- `--downsample 0.5`: (deprecated) applies the same factor to both images, exactly like before.
 
+Typical recommendations:
+- Use `--downsample-original` for most testing (0.25 or 0.5) and leave the paper at 1.0.
+- Reserve `--downsample-paper` only if the scan itself is massive and you know it still contains sufficient detail.
+- `--downsample 1.0` (or omitting the flag) uses full resolution on both images.
+
+> **Warning**: Using a value that reduces the paper image below ~128 pixels on a side will normally be skipped automatically, but it may still produce too few keypoints if the image has very little structure.
 ---
 
 ## 🛠️ Pipeline Architecture

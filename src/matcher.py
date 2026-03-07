@@ -75,7 +75,7 @@ class LightGlueMatcher:
         return src_pts, dst_pts, valid_scores
 
     @staticmethod
-    def estimate_transform(src_pts, dst_pts, ransac_thresh=3.0, confidence=0.995):
+    def estimate_transform(src_pts, dst_pts, ransac_thresh=3.0, confidence=0.9):
         if len(src_pts) < 10:
             print("Too few points for RANSAC (< 10).")
             return None, None

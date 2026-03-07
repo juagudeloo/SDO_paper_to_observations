@@ -21,7 +21,8 @@ def run_pipeline(
     download_dir: str = "./data/sunpy_images/",
     conf_thresh: float = 0.1,
     show: bool = False,
-    downsample: float = 1.0,
+    downsample_paper: float = 1.0,
+    downsample_original: float = 1.0,
 ):
     print("=== SDO Paper to Observation Pipeline ===")
     
@@ -38,13 +39,17 @@ def run_pipeline(
     paper_gray = Preprocessor.preprocess_paper_image(paper_img_raw)
     
     import cv2
-    if downsample != 1.0:
-        print(f"Downsampling images by a factor of {downsample} for faster testing...")
-        if len(original_raw.shape) >= 2:
-            new_h, new_w = int(original_raw.shape[0] * downsample), int(original_raw.shape[1] * downsample)
-            original_raw = cv2.resize(original_raw, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        if len(paper_gray.shape) >= 2:
-            new_h, new_w = int(paper_gray.shape[0] * downsample), int(paper_gray.shape[1] * downsample)
+    # compute and apply downsampling factors separately for original and paper
+    if downsample_original != 1.0 or downsample_paper != 1.0:
+        print(f"Downsampling images (orig={downsample_original}, paper={downsample_paper}) for faster testing...")
+    if len(original_raw.shape) >= 2 and downsample_original != 1.0:
+        new_h, new_w = int(original_raw.shape[0] * downsample_original), int(original_raw.shape[1] * downsample_original)
+        original_raw = cv2.resize(original_raw, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    if len(paper_gray.shape) >= 2 and downsample_paper != 1.0:
+        new_h, new_w = int(paper_gray.shape[0] * downsample_paper), int(paper_gray.shape[1] * downsample_paper)
+        if min(new_h, new_w) < 128:
+            print(f"Skipping downsample for paper image. It would become too small ({new_w}x{new_h}).")
+        else:
             paper_gray = cv2.resize(paper_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     # Pad images to multiple of 16 for DISK/LightGlue
@@ -88,15 +93,28 @@ if __name__ == "__main__":
     parser.add_argument("--outdir", type=str, default="./outputs", help="Output directory.")
     parser.add_argument("--conf", type=float, default=0.1, help="LightGlue confidence threshold.")
     parser.add_argument("--show", action="store_true", help="Display summary plot interactively.")
-    parser.add_argument("--downsample", type=float, default=1.0, help="Downsample ratio (e.g., 0.25) to speed up matching for testing.")
-    
+    parser.add_argument("--downsample", type=float, default=None,
+                        help="(deprecated) Uniform downsample factor for both images")
+    parser.add_argument("--downsample-paper", type=float, default=None,
+                        help="Downsample factor for the paper image only")
+    parser.add_argument("--downsample-original", type=float, default=None,
+                        help="Downsample factor for the HMI observation only")
+
     args = parser.parse_args()
-    
+
+    # determine effective scaling; maintain backwards compatibility
+    if args.downsample is not None:
+        ds_paper = ds_orig = args.downsample
+    else:
+        ds_paper = args.downsample_paper if args.downsample_paper is not None else 1.0
+        ds_orig = args.downsample_original if args.downsample_original is not None else 1.0
+
     run_pipeline(
         paper_image_path=args.paper,
         target_date=args.date,
         output_dir=args.outdir,
         conf_thresh=args.conf,
         show=args.show,
-        downsample=args.downsample,
+        downsample_paper=ds_paper,
+        downsample_original=ds_orig,
     )

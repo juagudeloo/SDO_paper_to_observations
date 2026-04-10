@@ -1,0 +1,425 @@
+# EXTRACT_PLOTS — Pipeline Documentation
+
+Step-by-step explanation of the SDO plot extraction pipeline.
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Prerequisites](#prerequisites)
+3. [Pipeline Structure](#pipeline-structure)
+4. [Stage 1: List Papers (`list`)](#stage-1-list-papers)
+5. [Stage 2: Extract Solar Images (`extract`)](#stage-2-extract-solar-images)
+6. [Solar Observation Classification Algorithm](#solar-observation-classification-algorithm)
+7. [Output Folder Naming](#output-folder-naming)
+8. [End-to-End Example](#end-to-end-example)
+9. [Known Limitations](#known-limitations)
+
+---
+
+## Overview
+
+The pipeline has two stages:
+
+1. **List** — Query the NASA ADS SDO API for papers published in a date range and write a CSV file so you can browse and select papers of interest.
+2. **Extract** — Given a paper ID, download the PDF, extract every embedded image, classify each as a solar observation or not, and save the solar images to a named folder.
+
+```
+[NASA ADS SDO API] ──list──> papers_YYYYMMDD_YYYYMMDD.csv
+                                         |
+                              (pick paper ID)
+                                         |
+[NASA ADS SDO API] ──extract──> output/YYYY-MM - Author, I/
+                                    ├── solar_001_p2_aia_false_color.png
+                                    ├── solar_002_p3_hmi_grayscale.png
+                                    └── extraction_log.json
+```
+
+---
+
+## Prerequisites
+
+### 1. Start the NASA ADS SDO API
+
+The API reads from a local SQLite database of ~30,000 SDO papers (2010–2024).
+
+```bash
+cd ../NASA_ADS_SDO
+./run_api.sh          # starts at http://localhost:8000
+```
+
+Verify it is running:
+```bash
+curl http://localhost:8000/
+# Expected: {"message": "SDO Documents API", "version": "...", "docs": "/docs"}
+```
+
+### 2. Python library: PyMuPDF
+
+The pipeline uses **PyMuPDF** (`fitz`) for all PDF operations — image extraction and text extraction from the first page. poppler-utils (`pdfimages`, `pdftotext`) is **not** required.
+
+```bash
+pip install pymupdf
+```
+
+Verify the import works:
+```python
+import fitz; print(fitz.version)
+```
+
+### 3. Python environment (pytorch_jupyter conda env)
+
+The shell script uses the `pytorch_jupyter` conda environment, which already has all required Python packages (`cv2`, `requests`, `PIL`, `numpy`).
+
+To install any missing packages:
+```bash
+conda activate pytorch_jupyter
+pip install -r requirements_extract.txt
+```
+
+---
+
+## Pipeline Structure
+
+```
+tools/
+└── extract_plots.sh      # Shell entry point (validates env, dispatches)
+
+scripts/
+├── list_papers.py        # Stage 1: date range → CSV
+├── extract_plots.py      # Stage 2: paper ID → images
+├── api_client.py         # API communication (health check, pagination, download)
+├── folder_naming.py      # Date formatting and author name parsing
+├── pdf_extractor.py      # PyMuPDF-based image and text extraction
+└── solar_classifier.py   # Image classifier (Hough circles + HSV analysis)
+```
+
+All algorithmic logic lives in Python scripts (in `scripts/`). The shell script (`tools/extract_plots.sh`) is a thin wrapper that validates the environment and dispatches to the appropriate Python script.
+
+---
+
+## Stage 1: List Papers
+
+**Command:**
+```bash
+./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01
+```
+
+**Implemented in:** `scripts/list_papers.py` (orchestrator) + `scripts/api_client.py` (API calls)
+
+**What it does:**
+
+1. **Validate inputs** — `validate_date()` in `list_papers.py` checks that `--start` and `--end` are in `YYYY-MM-DD` format and that start ≤ end. Fails fast with a clear message before any network call.
+
+2. **Check the API is alive** — `check_api_health(base_url)` in `api_client.py` sends `GET /` and confirms the JSON response contains a `"message"` key. If the server is unreachable (connection error or timeout), it prints the start-the-server instructions and exits.
+
+3. **Fetch papers year by year** — `get_documents_for_year(base_url, year)` in `api_client.py` calls `GET /documents/?year=YYYY&skip=N&limit=1000` in a loop, advancing the `skip` offset until the page returned is shorter than the page size. This handles databases with more than 1 000 papers per year without missing any records.
+
+4. **Filter to the exact month range** — `pub_date_in_range(pub_date, start_date, end_date)` in `api_client.py` compares dates at month granularity (ignoring the day, which the database always stores as `00`). The year-level API query is coarse; this function performs the precise client-side cut.
+
+5. **Sort results** — `main()` in `list_papers.py` sorts all collected documents by `(publication_date, id)` so the output file is in chronological order.
+
+6. **Write output files** — `main()` writes a CSV via Python's `csv.DictWriter` (truncating long titles with `truncate_title()`) and/or a Markdown file with abstracts via `write_markdown()`. Both are saved under `output/searched_papers/` by default.
+
+**Output columns in the CSV:**
+
+| Column | Description |
+|--------|-------------|
+| `id` | Paper ID in the database (use this for the `extract` command) |
+| `title` | Paper title (truncated to 80 chars) |
+| `authors` | Author list (note: often empty in the DB — see paper directly) |
+| `publication_date` | Publication date as stored (format: YYYY-MM-00) |
+| `doi` | Digital Object Identifier |
+| `bibcode` | NASA ADS bibliographic code |
+| `citation_count` | Number of citations |
+| `ads_url` | Link to the paper on NASA ADS |
+
+**Output file:** `papers_20120102_20130301.csv` (in current directory by default)
+
+**Date filtering note:** The database stores publication dates as `YYYY-MM-00` (day is always `00`). Filtering is done at month granularity: a paper from `2012-07-00` is included in the range `2012-01-02` to `2013-03-01` because July 2012 falls within that range.
+
+---
+
+## Stage 2: Extract Solar Images
+
+**Command:**
+```bash
+./tools/extract_plots.sh extract --id 15004866
+```
+
+**Implemented in:** `scripts/extract_plots.py` (orchestrator), with helpers from `api_client.py`, `folder_naming.py`, `pdf_extractor.py`, and `solar_classifier.py`.
+
+**What it does, step by step:**
+
+### Step 1: Fetch metadata
+**Function:** `get_document_by_id(base_url, doc_id)` — `scripts/api_client.py`
+
+Sends `GET /documents/{id}` to the API and returns the full JSON record for the paper (title, publication date, bibcode, DOI, etc.). Raises a clear `ValueError` if the ID is not in the database (HTTP 404), so the user knows immediately if they typed a wrong ID.
+
+### Step 2: Download PDF
+**Function:** `download_pdf(base_url, doc_id, dest_path, source=None)` — `scripts/api_client.py`
+
+Sends `GET /documents/{id}/download-pdf` with optional `?source=arxiv` or `?source=publisher`. The response is a binary PDF streamed in 8 KB chunks to avoid loading the whole file into memory. The file is saved to a system temporary directory that is cleaned up automatically at the end. If no PDF is publicly available the function raises `RuntimeError` and prints the ADS abstract page URL so the user can access the paper manually.
+
+### Step 3: Parse author name
+**Functions:** `extract_first_page_text(pdf_path)` — `scripts/pdf_extractor.py`  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`parse_first_author(authors_field, bibcode, pdf_text)` — `scripts/folder_naming.py`
+
+`extract_first_page_text` uses **PyMuPDF** (`fitz`) to pull the raw text from the first PDF page — fast and reliable without needing poppler.
+
+`parse_first_author` then applies three strategies in order:
+1. **`_parse_authors_field()`** — tries the database `authors` field (always empty in this DB, but future-proof).
+2. **`_parse_pdf_text()`** — applies three regular expressions against the first 3 000 characters of extracted text to match the common astronomy author formats (`F. I. LastName`, `LastName, F. I.`, `FirstName LastName`).
+3. **`_parse_bibcode()`** — fallback: the last character of the NASA ADS bibcode is always the first author's surname initial (e.g. `2012A&A...543A..53S` → `S`).
+
+### Step 4: Create output folder
+**Functions:** `format_publication_date(pub_date)` and `build_folder_name(pub_date, last_name, first_initial)` — `scripts/folder_naming.py`
+
+`format_publication_date` converts the DB format `YYYY-MM-00` (day always `00`) to a human-readable string: `2012-07-00` → `2012-07`, `2010-00-00` → `2010`.
+
+`build_folder_name` combines the formatted date and author into `YYYY-MM - LastName, F`, then strips any characters forbidden by common filesystems (`/ \ : * ? " < > |`). The resulting folder is created inside `--output-dir` (default `./output/`).
+
+### Step 5: Extract images
+**Function:** `extract_pdf_images(pdf_path, output_dir)` — `scripts/pdf_extractor.py`
+
+Uses **PyMuPDF** (`fitz`) to iterate every page and collect embedded images via `page.get_images(full=True)`. PyMuPDF is preferred over the older `pdfimages` (poppler) because it also finds images inside Form XObjects and indirect image streams that poppler silently skips.
+
+Each unique image (tracked by its internal `xref` reference number to avoid duplicates from shared objects) is decoded and saved as a PNG via the helper `_save_as_png()` — which converts JPEG, JPEG2000, and CMYK images to standard RGB PNG on the fly using **Pillow**.
+
+The function returns a list of `ImageMetadata` dataclass objects, one per image, carrying: sequential index, page number, width × height, color space (`rgb`/`gray`/`cmyk`), original encoding, and the PNG file path.
+
+### Step 6: Classify images
+**Function:** `classify_image(img_meta)` — `scripts/solar_classifier.py`
+
+The main entry point runs two sub-functions:
+
+- **`_metadata_prefilter(img_meta)`** — immediately rejects images smaller than 200 × 200 px (logos, icons) or with a palette/indexed color space (diagrams). Returns a rejected `ClassificationResult` without ever opening the file.
+- **`_classify_pixels(img_bgr, path)`** — loads the PNG with OpenCV, converts to both grayscale and HSV, then accumulates an integer raw score across Steps 2–8 of the [classification algorithm](#solar-observation-classification-algorithm).
+
+The classification result (a `ClassificationResult` dataclass) contains:
+- `is_solar`: `True` if raw score ≥ 5
+- `score`: raw score normalized to 0–1 (dividing by 20)
+- `signals`: ordered list of string tags explaining each score contribution (e.g. `dark_background`, `full_disk_circle_r320`)
+- `image_type`: `aia_false_color`, `hmi_grayscale`, `unknown`, or `rejected`
+
+### Step 7: Save solar images
+**Implemented in:** `main()` — `scripts/extract_plots.py`
+
+Iterates the list of `(ImageMetadata, ClassificationResult)` pairs for images that passed the filter (`is_solar=True` and `score >= --min-score`, default 0.25). Each is copied from the temp directory to the output folder using `shutil.copy()` with a descriptive filename that encodes its sequential number, PDF page, and detected type:
+```
+solar_001_p2_aia_false_color.png
+solar_002_p3_hmi_grayscale.png
+```
+
+### Step 8: Write extraction log
+**Implemented in:** `main()` — `scripts/extract_plots.py`
+
+Writes `extraction_log.json` to the output folder using Python's built-in `json.dump`. The log contains the paper metadata at the top, plus one entry per image (both kept and rejected) with its size, color space, classification score, signals list, and image type. This log is the audit trail that lets you review why an image was kept or discarded without re-running the pipeline.
+
+---
+
+## Solar Observation Classification Algorithm
+
+**Implemented in:** `scripts/solar_classifier.py` — primarily `_classify_pixels()`, called by `classify_image()`.
+
+The classifier uses a sequence of additive integer scoring steps. An image is classified as solar if the raw score is **≥ 5**. All thresholds and score weights are defined as module-level constants at the top of `solar_classifier.py` so they can be tuned in one place without touching the logic.
+
+### Step 1: Metadata pre-filter (fast, no pixel reading)
+**Function:** `_metadata_prefilter(img_meta)` — `solar_classifier.py`
+
+This function checks the `ImageMetadata` fields (width, height, color_space) that were already available from the PDF extraction — no file I/O needed. If rejected, `classify_image()` returns immediately without ever calling `cv2.imread()`.
+
+| Condition | Action | Signal |
+|-----------|--------|--------|
+| width < 200 or height < 200 | Reject immediately | `too_small` |
+| color_space = 'index' (palette) | Reject immediately | `palette_indexed` |
+
+**Why:** Small images are logos, icons, or decorative elements. Palette-indexed images are diagrams or clip-art, never photographic solar data.
+
+### Step 2: Background color analysis (±4 points)
+**Function:** `_classify_pixels()` — `solar_classifier.py` (background analysis block)
+
+After loading the image with `cv2.imread()` and converting to HSV with `cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)`, the code builds a boolean `border_mask` covering the outer 5% ring of pixels on all four sides. It then samples the **V** (Value/brightness) channel of those border pixels.
+
+| Condition | Score | Signal |
+|-----------|-------|--------|
+| >50% of border pixels have V > 240 (white) | −4 | `white_background` |
+| >20% of border pixels have V < 25 (dark) | +2 | `dark_background` |
+
+**Why:** Scientific plots (light curves, spectra) almost always have white backgrounds. Solar observations from space have a very dark background — the background is the vacuum of space or the solar limb region.
+
+### Step 3: Global dark pixel ratio (+1 or +2)
+**Function:** `_classify_pixels()` — dark pixel ratio block
+
+Computes the fraction of *all* pixels whose V channel is < 20 (near-black) using NumPy's vectorised comparison `(v_ch < 20).mean()`.
+
+| Condition | Score | Signal |
+|-----------|-------|--------|
+| > 15% dark pixels | +2 | `dark_region_XX%` |
+| 5–15% dark pixels | +1 | `moderate_dark_region` |
+
+**Why:** Solar full-disk images have a large black region around the solar disk. Even cropped active-region images often show dark corona at the edges.
+
+### Step 4: Hough Circle Transform (+3 or +8)
+**Function:** `_classify_pixels()` — Hough circle block
+
+This is the most important signal. It detects the circular solar disk. The grayscale image is first blurred with a 9×9 Gaussian kernel (`cv2.GaussianBlur`) to suppress noise, then passed to `cv2.HoughCircles` with the HOUGH_GRADIENT method:
+
+```python
+min_radius = int(min(H, W) * 0.30)   # circle must be 30–55% of shorter dimension
+max_radius = int(min(H, W) * 0.55)
+circles = cv2.HoughCircles(blurred_gray, cv2.HOUGH_GRADIENT,
+                           dp=1.5, minDist=min(H,W)*0.4,
+                           param1=100, param2=40,
+                           minRadius=min_radius, maxRadius=max_radius)
+```
+
+If a circle is found, the code checks whether the detected center `(cx, cy)` falls within the central 50% of the image (i.e., `0.25·W < cx < 0.75·W` and `0.25·H < cy < 0.75·H`). This distinguishes a full-disk image (circle centered) from a partially-visible disk (circle off-center). The flag `is_full_disk` is set here and reused in Steps 6 and 7.
+
+| Condition | Score | Signal |
+|-----------|-------|--------|
+| Circle found, center in middle 50% of image | +8 | `full_disk_circle_rNNN` |
+| Circle found, center off-center | +3 | `off_center_circle` |
+
+**Why:** Full-disk SDO images always show the solar disk as a large circle centered in the image. The radius range (30–55% of the shorter dimension) is tuned to match full-disk solar images at typical figure sizes in papers.
+
+### Step 5: AIA False-Color Detection (+4 or +8)
+**Function:** `_classify_pixels()` — AIA color detection block
+
+SDO/AIA produces false-colored images at different EUV wavelengths, each with a characteristic color palette. The code converts the image to HSV and builds three Boolean pixel masks (one per color family) combined with a saturation threshold (`s_ch > 80`) so that faint, nearly-grey pixels are ignored:
+
+```python
+orange_mask = (h_ch >= 5)  & (h_ch <= 30)  & (s_ch > 80)   # 193, 94, 1600 Å
+blue_mask   = (h_ch >= 42) & (h_ch <= 65)  & (s_ch > 80)   # 171 Å
+red_mask    = ((h_ch <= 5) | (h_ch >= 170)) & (s_ch > 80)  # 304 Å
+aia_ratio   = orange_mask.mean() + blue_mask.mean() + red_mask.mean()
+```
+
+| Wavelength | Color | HSV hue range (OpenCV 0–179) |
+|------------|-------|------------------------------|
+| 193 Å, 94 Å, 1600 Å | Orange/gold | 5–30 |
+| 171 Å | Blue-green | 42–65 |
+| 304 Å | Red | 0–5 or 170–179 |
+
+| Condition | Score | Signal |
+|-----------|-------|--------|
+| > 15% of pixels match AIA colors | +8 | `aia_false_color_XX%` |
+| 5–15% of pixels match AIA colors | +4 | `aia_weak_color_XX%` |
+| Sets `image_type = "aia_false_color"` | | |
+
+### Step 6: HMI Grayscale Detection (+3 or +4)
+**Function:** `_classify_pixels()` — HMI detection block
+
+SDO/HMI images (continuum intensity, line-of-sight magnetic field, Dopplergram) are grayscale or near-grayscale. The test is simple: compute `s_ch.mean()` (mean saturation over the whole image). A very low mean saturation means all pixels are nearly grey.
+
+| Condition | Score | Signal |
+|-----------|-------|--------|
+| Mean saturation < 15 AND full disk detected | +4 | `hmi_grayscale_satN.N` |
+| Mean saturation < 15 AND no full disk (cropped region) | +3 | `hmi_region_satN.N` |
+
+**Why:** Cropped HMI active-region images are common in papers and will not have passed the Hough circle test, so they need their own unconditional positive score to overcome the threshold.
+
+### Step 7: Texture Analysis for Cropped Regions (+2)
+**Function:** `_classify_pixels()` — texture block
+
+Cropped active regions (not full-disk) won't trigger the Hough circle. However, the solar surface has characteristic granulation and sunspot structure that produces high pixel variance. The test is `gray.std()` — the standard deviation of grayscale pixel values across the entire image.
+
+| Condition | Score | Signal |
+|-----------|-------|--------|
+| `std(gray) > 40` AND `is_full_disk = False` | +2 | `high_texture_stdNN` |
+
+### Step 8: Scientific Plot Penalty (−2 or −5)
+**Function:** `_classify_pixels()` — plot penalty block
+
+Scientific plots (light curves, power spectra, scatter plots) tend to have dense edges (many axis ticks and text) and large white interior regions. Two metrics are combined:
+
+```python
+edge_density        = cv2.Canny(gray, 50, 150).mean() / 255.0
+interior_white_ratio = (gray[H//8:7*H//8, W//8:7*W//8] > 240).mean()
+```
+
+`cv2.Canny` runs the Canny edge detector. Dividing by 255 gives the fraction of edge pixels. The interior crop (central 75% in each dimension) avoids counting border artefacts.
+
+| Condition | Score | Signal |
+|-----------|-------|--------|
+| edge_density > 0.15 AND interior white > 30% | −5 | `scientific_plot_edgesN.NN_whiteXX%` |
+| edge_density > 0.10 AND interior white > 20% | −2 | `possible_diagram` |
+
+### Final Decision
+**Function:** end of `_classify_pixels()` — `solar_classifier.py`
+
+```python
+is_solar   = (raw_score >= SOLAR_SCORE_THRESHOLD)   # constant = 5
+normalized = max(0.0, min(1.0, raw_score / SCORE_NORMALIZATION))  # constant = 20
+```
+
+The raw integer score is compared against the threshold (5). The normalized confidence (0–1) is returned alongside the `is_solar` boolean, the `signals` list, and the `image_type` string. All four fields are packed into a `ClassificationResult` dataclass and returned up the call stack to `main()` in `extract_plots.py`.
+
+---
+
+## Output Folder Naming
+
+The output folder for each paper follows this format:
+
+```
+YYYY-MM - LastName, F
+```
+
+For example: `2012-07 - Song, Y`
+
+**Date handling:** The database stores publication dates as `YYYY-MM-00` (day is always `00`). The formatter strips the `00` day to produce `YYYY-MM`. For year-only entries (`YYYY-00-00`), it produces just `YYYY`.
+
+**Author detection:** The database's `authors` field is always empty. The pipeline extracts the first author from the PDF's first page text using regex patterns for common astronomy journal author formats. If parsing fails, the NASA ADS bibcode's last character (which encodes the first author's surname initial) is used as a fallback.
+
+---
+
+## End-to-End Example
+
+```bash
+# 1. Start the API (in a separate terminal)
+cd ../NASA_ADS_SDO && ./run_api.sh
+
+# 2. List papers from 2012 to 2013
+./tools/extract_plots.sh list --start 2012-01-01 --end 2013-12-31
+# Output: papers_20120101_20131231.csv
+# Open the CSV, browse titles, pick a paper ID (e.g. 15004866)
+
+# 3. Extract solar images from that paper
+./tools/extract_plots.sh extract --id 15004866
+# Output:
+#   Processing paper ID 15004866
+#     Title     : White-light flares: a TRACE, RHESSI and SOHO/MDI multi-wavelength stu...
+#     Published : 2012-07-00
+#     Bibcode   : 2012A&A...543A..53S
+#     PDF size  : 1.40 MB
+#     Author    : Song, Y
+#     Output    : output/2012-07 - Song, Y
+#   Found 5 embedded images in PDF
+#     [skip ] img-000 p1 240x180 index score=0.00 [too_small]
+#     [skip ] img-001 p1 240x180 index score=0.00 [palette_indexed]
+#     [SOLAR] img-002 p3 1024x768 rgb  score=0.65 [aia_false_color_22%, dark_background, full_disk_circle_r320]
+#     ...
+#   Extraction complete: 3/5 images classified as solar observations
+#   Output folder: output/2012-07 - Song, Y
+#   Log: output/2012-07 - Song, Y/extraction_log.json
+
+# 4. View the extracted images
+ls output/2012-07\ -\ Song,\ Y/
+```
+
+---
+
+## Known Limitations
+
+1. **Multi-panel figures**: Many SDO papers show composite figures (e.g. a 3×2 grid of AIA images at different wavelengths). PyMuPDF extracts the entire figure as one embedded image object, which is the correct behavior for downstream image matching.
+
+2. **Author detection from PDF**: Parsing author names from raw PDF text is heuristic and may fail for unusual journal formats. In that case, the bibcode fallback provides an initial letter instead of a full last name.
+
+3. **Empty authors field in DB**: The NASA ADS SDO database has an empty `authors` column for all records. Author names are always extracted from the PDF text.
+
+4. **Papers without public PDFs**: Some papers (especially publisher-only papers) may not have freely accessible PDFs. The pipeline will print a warning with the ADS abstract page URL where you can access the paper directly.
+
+5. **Cropped active region images**: Images that show only a small portion of the solar disk (no visible limb) may score lower than full-disk images. The texture analysis step helps, but may not always be sufficient. Adjusting `--min-score` downward can recover these.
+
+6. **CMYK images**: Publisher PDFs often embed images in CMYK color space. PyMuPDF extracts them as raw bytes and `_save_as_png()` converts them to RGB via Pillow before saving, so they are handled correctly by the classifier.

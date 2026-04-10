@@ -1,0 +1,13 @@
+# Requirements for the SDO plot extraction pipeline
+# All packages below are available in the 'pytorch_jupyter' conda environment.
+#
+# If any are missing, activate the environment and run:
+#   conda activate pytorch_jupyter
+#   pip install -r requirements_extract.txt
+
+numpy>=1.26.0
+Pillow>=10.0.0
+opencv-python>=4.8.0
+requests>=2.31.0
+matplotlib>=3.7.0
+pymupdf>=1.23.0

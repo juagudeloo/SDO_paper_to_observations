@@ -2,8 +2,9 @@ pdfs/
 output/
 images/
 prompts/
+LightGlue/
 *.code-workspace
-
+data/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

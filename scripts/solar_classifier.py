@@ -165,12 +165,6 @@ def _metadata_prefilter(img_meta) -> Optional[ClassificationResult]:
             signals=["too_small"], image_type="rejected"
         )
 
-    if img_meta.color_space == "index":
-        return ClassificationResult(
-            is_solar=False, score=0.0,
-            signals=["palette_indexed"], image_type="rejected"
-        )
-
     return None
 
 

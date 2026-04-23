@@ -233,9 +233,8 @@ This function checks the `ImageMetadata` fields (width, height, color_space) tha
 | Condition | Action | Signal |
 |-----------|--------|--------|
 | width < 200 or height < 200 | Reject immediately | `too_small` |
-| color_space = 'index' (palette) | Reject immediately | `palette_indexed` |
 
-**Why:** Small images are logos, icons, or decorative elements. Palette-indexed images are diagrams or clip-art, never photographic solar data.
+**Why:** Small images are logos, icons, or decorative elements. Palette-indexed images are no longer rejected here — paper figures are often saved as indexed PNGs to reduce file size even when they show real solar observations. They are instead converted to BGR by `cv2.imread()` and proceed to pixel-level classification.
 
 ### Step 2: Background color analysis (±4 points)
 **Function:** `_classify_pixels()` — `solar_classifier.py` (background analysis block)

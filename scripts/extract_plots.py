@@ -24,13 +24,13 @@ import shutil
 import sys
 import tempfile
 
-# Allow running as a script from repo root
-sys.path.insert(0, os.path.dirname(__file__))
+# Allow running as a script from any directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from api_client import check_api_health, get_api_base_url, get_document_by_id, download_pdf
-from folder_naming import build_folder_name, parse_first_author
-from pdf_extractor import extract_pdf_images, extract_first_page_text
-from solar_classifier import classify_image
+from utils.api_client import check_api_health, get_api_base_url, get_document_by_id, download_pdf
+from utils.folder_naming import build_folder_name, parse_first_author
+from utils.pdf_extractor import extract_pdf_images, extract_first_page_text
+from utils.solar_classifier import classify_image
 
 logging.basicConfig(
     level=logging.WARNING,

@@ -18,9 +18,9 @@ import logging
 import os
 import sys
 
-# Allow running as a script from repo root
-sys.path.insert(0, os.path.dirname(__file__))
-from api_client import (
+# Allow running as a script from any directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from utils.api_client import (
     check_api_health,
     get_api_base_url,
     get_documents_for_year,

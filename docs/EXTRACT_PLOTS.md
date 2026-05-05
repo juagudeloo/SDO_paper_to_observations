@@ -86,16 +86,18 @@ pip install -r requirements_extract.txt
 tools/
 └── extract_plots.sh      # Shell entry point (validates env, dispatches)
 
-scripts/
+scripts/                  # Main entry points (run directly)
 ├── list_papers.py        # Stage 1: date range → CSV
-├── extract_plots.py      # Stage 2: paper ID → images
+└── extract_plots.py      # Stage 2: paper ID → images
+
+utils/                    # Utility modules (imported by scripts/)
 ├── api_client.py         # API communication (health check, pagination, download)
 ├── folder_naming.py      # Date formatting and author name parsing
 ├── pdf_extractor.py      # PyMuPDF-based image and text extraction
 └── solar_classifier.py   # Image classifier (Hough circles + HSV analysis)
 ```
 
-All algorithmic logic lives in Python scripts (in `scripts/`). The shell script (`tools/extract_plots.sh`) is a thin wrapper that validates the environment and dispatches to the appropriate Python script.
+The shell script (`tools/extract_plots.sh`) is a thin wrapper that validates the environment and dispatches to the appropriate Python script in `scripts/`. All reusable algorithmic logic lives in `utils/`.
 
 ---
 
@@ -106,17 +108,17 @@ All algorithmic logic lives in Python scripts (in `scripts/`). The shell script 
 ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01
 ```
 
-**Implemented in:** `scripts/list_papers.py` (orchestrator) + `scripts/api_client.py` (API calls)
+**Implemented in:** `scripts/list_papers.py` (orchestrator) + `utils/api_client.py` (API calls)
 
 **What it does:**
 
 1. **Validate inputs** — `validate_date()` in `list_papers.py` checks that `--start` and `--end` are in `YYYY-MM-DD` format and that start ≤ end. Fails fast with a clear message before any network call.
 
-2. **Check the API is alive** — `check_api_health(base_url)` in `api_client.py` sends `GET /` and confirms the JSON response contains a `"message"` key. If the server is unreachable (connection error or timeout), it prints the start-the-server instructions and exits.
+2. **Check the API is alive** — `check_api_health(base_url)` in `utils/api_client.py` sends `GET /` and confirms the JSON response contains a `"message"` key. If the server is unreachable (connection error or timeout), it prints the start-the-server instructions and exits.
 
-3. **Fetch papers year by year** — `get_documents_for_year(base_url, year)` in `api_client.py` calls `GET /documents/?year=YYYY&skip=N&limit=1000` in a loop, advancing the `skip` offset until the page returned is shorter than the page size. This handles databases with more than 1 000 papers per year without missing any records.
+3. **Fetch papers year by year** — `get_documents_for_year(base_url, year)` in `utils/api_client.py` calls `GET /documents/?year=YYYY&skip=N&limit=1000` in a loop, advancing the `skip` offset until the page returned is shorter than the page size. This handles databases with more than 1 000 papers per year without missing any records.
 
-4. **Filter to the exact month range** — `pub_date_in_range(pub_date, start_date, end_date)` in `api_client.py` compares dates at month granularity (ignoring the day, which the database always stores as `00`). The year-level API query is coarse; this function performs the precise client-side cut.
+4. **Filter to the exact month range** — `pub_date_in_range(pub_date, start_date, end_date)` in `utils/api_client.py` compares dates at month granularity (ignoring the day, which the database always stores as `00`). The year-level API query is coarse; this function performs the precise client-side cut.
 
 5. **Sort results** — `main()` in `list_papers.py` sorts all collected documents by `(publication_date, id)` so the output file is in chronological order.
 
@@ -148,23 +150,23 @@ All algorithmic logic lives in Python scripts (in `scripts/`). The shell script 
 ./tools/extract_plots.sh extract --id 15004866
 ```
 
-**Implemented in:** `scripts/extract_plots.py` (orchestrator), with helpers from `api_client.py`, `folder_naming.py`, `pdf_extractor.py`, and `solar_classifier.py`.
+**Implemented in:** `scripts/extract_plots.py` (orchestrator), with helpers from `utils/api_client.py`, `utils/folder_naming.py`, `utils/pdf_extractor.py`, and `utils/solar_classifier.py`.
 
 **What it does, step by step:**
 
 ### Step 1: Fetch metadata
-**Function:** `get_document_by_id(base_url, doc_id)` — `scripts/api_client.py`
+**Function:** `get_document_by_id(base_url, doc_id)` — `utils/api_client.py`
 
 Sends `GET /documents/{id}` to the API and returns the full JSON record for the paper (title, publication date, bibcode, DOI, etc.). Raises a clear `ValueError` if the ID is not in the database (HTTP 404), so the user knows immediately if they typed a wrong ID.
 
 ### Step 2: Download PDF
-**Function:** `download_pdf(base_url, doc_id, dest_path, source=None)` — `scripts/api_client.py`
+**Function:** `download_pdf(base_url, doc_id, dest_path, source=None)` — `utils/api_client.py`
 
 Sends `GET /documents/{id}/download-pdf` with optional `?source=arxiv` or `?source=publisher`. The response is a binary PDF streamed in 8 KB chunks to avoid loading the whole file into memory. The file is saved to a system temporary directory that is cleaned up automatically at the end. If no PDF is publicly available the function raises `RuntimeError` and prints the ADS abstract page URL so the user can access the paper manually.
 
 ### Step 3: Parse author name
-**Functions:** `extract_first_page_text(pdf_path)` — `scripts/pdf_extractor.py`  
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`parse_first_author(authors_field, bibcode, pdf_text)` — `scripts/folder_naming.py`
+**Functions:** `extract_first_page_text(pdf_path)` — `utils/pdf_extractor.py`  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;`parse_first_author(authors_field, bibcode, pdf_text)` — `utils/folder_naming.py`
 
 `extract_first_page_text` uses **PyMuPDF** (`fitz`) to pull the raw text from the first PDF page — fast and reliable without needing poppler.
 
@@ -174,14 +176,14 @@ Sends `GET /documents/{id}/download-pdf` with optional `?source=arxiv` or `?sour
 3. **`_parse_bibcode()`** — fallback: the last character of the NASA ADS bibcode is always the first author's surname initial (e.g. `2012A&A...543A..53S` → `S`).
 
 ### Step 4: Create output folder
-**Functions:** `format_publication_date(pub_date)` and `build_folder_name(pub_date, last_name, first_initial)` — `scripts/folder_naming.py`
+**Functions:** `format_publication_date(pub_date)` and `build_folder_name(pub_date, last_name, first_initial)` — `utils/folder_naming.py`
 
 `format_publication_date` converts the DB format `YYYY-MM-00` (day always `00`) to a human-readable string: `2012-07-00` → `2012-07`, `2010-00-00` → `2010`.
 
 `build_folder_name` combines the formatted date and author into `YYYY-MM - LastName, F`, then strips any characters forbidden by common filesystems (`/ \ : * ? " < > |`). The resulting folder is created inside `--output-dir` (default `./output/`).
 
 ### Step 5: Extract images
-**Function:** `extract_pdf_images(pdf_path, output_dir)` — `scripts/pdf_extractor.py`
+**Function:** `extract_pdf_images(pdf_path, output_dir)` — `utils/pdf_extractor.py`
 
 Uses **PyMuPDF** (`fitz`) to iterate every page and collect embedded images via `page.get_images(full=True)`. PyMuPDF is preferred over the older `pdfimages` (poppler) because it also finds images inside Form XObjects and indirect image streams that poppler silently skips.
 
@@ -190,7 +192,7 @@ Each unique image (tracked by its internal `xref` reference number to avoid dupl
 The function returns a list of `ImageMetadata` dataclass objects, one per image, carrying: sequential index, page number, width × height, color space (`rgb`/`gray`/`cmyk`), original encoding, and the PNG file path.
 
 ### Step 6: Classify images
-**Function:** `classify_image(img_meta)` — `scripts/solar_classifier.py`
+**Function:** `classify_image(img_meta)` — `utils/solar_classifier.py`
 
 The main entry point runs two sub-functions:
 
@@ -221,12 +223,12 @@ Writes `extraction_log.json` to the output folder using Python's built-in `json.
 
 ## Solar Observation Classification Algorithm
 
-**Implemented in:** `scripts/solar_classifier.py` — primarily `_classify_pixels()`, called by `classify_image()`.
+**Implemented in:** `utils/solar_classifier.py` — primarily `_classify_pixels()`, called by `classify_image()`.
 
-The classifier uses a sequence of additive integer scoring steps. An image is classified as solar if the raw score is **≥ 5**. All thresholds and score weights are defined as module-level constants at the top of `solar_classifier.py` so they can be tuned in one place without touching the logic.
+The classifier uses a sequence of additive integer scoring steps. An image is classified as solar if the raw score is **≥ 5**. All thresholds and score weights are defined as module-level constants at the top of `utils/solar_classifier.py` so they can be tuned in one place without touching the logic.
 
 ### Step 1: Metadata pre-filter (fast, no pixel reading)
-**Function:** `_metadata_prefilter(img_meta)` — `solar_classifier.py`
+**Function:** `_metadata_prefilter(img_meta)` — `utils/solar_classifier.py`
 
 This function checks the `ImageMetadata` fields (width, height, color_space) that were already available from the PDF extraction — no file I/O needed. If rejected, `classify_image()` returns immediately without ever calling `cv2.imread()`.
 
@@ -237,7 +239,7 @@ This function checks the `ImageMetadata` fields (width, height, color_space) tha
 **Why:** Small images are logos, icons, or decorative elements. Palette-indexed images are no longer rejected here — paper figures are often saved as indexed PNGs to reduce file size even when they show real solar observations. They are instead converted to BGR by `cv2.imread()` and proceed to pixel-level classification.
 
 ### Step 2: Background color analysis (±4 points)
-**Function:** `_classify_pixels()` — `solar_classifier.py` (background analysis block)
+**Function:** `_classify_pixels()` — `utils/solar_classifier.py` (background analysis block)
 
 After loading the image with `cv2.imread()` and converting to HSV with `cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)`, the code builds a boolean `border_mask` covering the outer 5% ring of pixels on all four sides. It then samples the **V** (Value/brightness) channel of those border pixels.
 
@@ -346,7 +348,7 @@ interior_white_ratio = (gray[H//8:7*H//8, W//8:7*W//8] > 240).mean()
 | edge_density > 0.10 AND interior white > 20% | −2 | `possible_diagram` |
 
 ### Final Decision
-**Function:** end of `_classify_pixels()` — `solar_classifier.py`
+**Function:** end of `_classify_pixels()` — `utils/solar_classifier.py`
 
 ```python
 is_solar   = (raw_score >= SOLAR_SCORE_THRESHOLD)   # constant = 5

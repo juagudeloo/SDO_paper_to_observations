@@ -11,3 +11,7 @@ opencv-python>=4.8.0
 requests>=2.31.0
 matplotlib>=3.7.0
 pymupdf>=1.23.0
+
+# Required for the label stage (caption-to-image linking + structure classification)
+# torch is already available in the pytorch_jupyter conda environment
+transformers>=4.30.0

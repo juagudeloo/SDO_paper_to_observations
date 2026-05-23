@@ -169,6 +169,39 @@ def _save_as_png(image_bytes: bytes, ext: str, dest_path: str) -> None:
 # Text extraction
 # ---------------------------------------------------------------------------
 
+def extract_full_text(pdf_path: str, max_chars: int = 8000) -> str:
+    """
+    Extract and concatenate text from all pages of a PDF, stopping once
+    max_chars is reached.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        max_chars: Maximum characters to return (default 8000).
+
+    Returns:
+        Concatenated page text, truncated to max_chars, or empty string on failure.
+    """
+    if not _FITZ_AVAILABLE:
+        return ""
+    if not os.path.isfile(pdf_path):
+        return ""
+    try:
+        doc = fitz.open(pdf_path)
+        chunks: list = []
+        total = 0
+        for page in doc:
+            t = page.get_text()
+            chunks.append(t)
+            total += len(t)
+            if total >= max_chars:
+                break
+        doc.close()
+        return "".join(chunks)[:max_chars]
+    except Exception as exc:
+        logger.warning("PyMuPDF full-text extraction error: %s", exc)
+        return ""
+
+
 def extract_first_page_text(pdf_path: str) -> str:
     """
     Extract text from the first page of a PDF using PyMuPDF.

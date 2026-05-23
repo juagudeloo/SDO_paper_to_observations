@@ -147,7 +147,7 @@ The shell script (`tools/extract_plots.sh`) is a thin wrapper that validates the
 
 **Command:**
 ```bash
-./tools/extract_plots.sh extract --id 15004866
+./tools/extract_plots.sh extract --id 2620529
 ```
 
 **Implemented in:** `scripts/extract_plots.py` (orchestrator), with helpers from `utils/api_client.py`, `utils/folder_naming.py`, `utils/pdf_extractor.py`, and `utils/solar_classifier.py`.
@@ -367,7 +367,7 @@ The output folder for each paper follows this format:
 YYYY-MM - LastName, F
 ```
 
-For example: `2012-07 - Song, Y`
+For example: `2012-01 - Labrosse, N`
 
 **Date handling:** The database stores publication dates as `YYYY-MM-00` (day is always `00`). The formatter strips the `00` day to produce `YYYY-MM`. For year-only entries (`YYYY-00-00`), it produces just `YYYY`.
 
@@ -384,26 +384,26 @@ cd ../NASA_ADS_SDO && ./run_api.sh
 # 2. List papers from 2012 to 2013
 ./tools/extract_plots.sh list --start 2012-01-01 --end 2013-12-31
 # Output: papers_20120101_20131231.csv
-# Open the CSV, browse titles, pick a paper ID (e.g. 15004866)
+# Open the CSV, browse titles, pick a paper ID (e.g. 2620529)
 
 # 3. Extract solar images from that paper
-./tools/extract_plots.sh extract --id 15004866
+./tools/extract_plots.sh extract --id 2620529
 # Output:
-#   Processing paper ID 15004866
+#   Processing paper ID 2620529
 #     Title     : White-light flares: a TRACE, RHESSI and SOHO/MDI multi-wavelength stu...
 #     Published : 2012-07-00
 #     Bibcode   : 2012A&A...543A..53S
 #     PDF size  : 1.40 MB
 #     Author    : Song, Y
-#     Output    : output/2012-07 - Song, Y
+#     Output    : output/2012-01 - Labrosse, N
 #   Found 5 embedded images in PDF
 #     [skip ] img-000 p1 240x180 index score=0.00 [too_small]
 #     [skip ] img-001 p1 240x180 index score=0.00 [palette_indexed]
 #     [SOLAR] img-002 p3 1024x768 rgb  score=0.65 [aia_false_color_22%, dark_background, full_disk_circle_r320]
 #     ...
 #   Extraction complete: 3/5 images classified as solar observations
-#   Output folder: output/2012-07 - Song, Y
-#   Log: output/2012-07 - Song, Y/extraction_log.json
+#   Output folder: output/2012-01 - Labrosse, N
+#   Log: output/2012-01 - Labrosse, N/extraction_log.json
 
 # 4. View the extracted images
 ls output/2012-07\ -\ Song,\ Y/

@@ -12,9 +12,18 @@ Requires:
     torch  (already available in the pytorch_jupyter conda environment)
 """
 
+import os
 import re
 import logging
+from pathlib import Path
 from typing import List, Optional, Tuple
+
+# Redirect HuggingFace cache to the project's models/ directory instead of ~/.cache/huggingface.
+# Must be set before transformers is imported (lazy import in _get_pipeline respects this).
+os.environ.setdefault(
+    "HF_HOME",
+    str(Path(__file__).resolve().parent.parent / "models"),
+)
 
 logger = logging.getLogger(__name__)
 

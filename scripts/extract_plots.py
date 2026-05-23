@@ -11,9 +11,9 @@ Given a paper ID from the NASA ADS SDO database:
   6. Write an extraction_log.json with full classification details.
 
 Usage:
-  python3 extract_plots.py --id 15004866
-  python3 extract_plots.py --id 15004866 --output-dir ./output --source arxiv
-  python3 extract_plots.py --id 15004866 --keep-pdf --min-score 0.25
+  python3 extract_plots.py --id 2620529
+  python3 extract_plots.py --id 2620529 --output-dir ./output --source arxiv
+  python3 extract_plots.py --id 2620529 --keep-pdf --min-score 0.25
 """
 
 import argparse

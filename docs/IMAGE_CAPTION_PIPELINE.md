@@ -55,7 +55,7 @@ The CSV is the primary deliverable: it links each solar image to its caption tex
 The label stage needs the `extraction_log.json` and the original PDF in the paper folder. The PDF is not kept by default — you must pass `--keep-pdf` to the extract stage:
 
 ```bash
-./tools/extract_plots.sh extract --id 15004866 --keep-pdf
+./tools/extract_plots.sh extract --id 2620529 --keep-pdf
 ```
 
 If the paper folder already exists but has no PDF, re-run the extract stage with `--keep-pdf`.
@@ -394,31 +394,31 @@ cd ../NASA_ADS_SDO && ./run_api.sh
 # → papers_20120101_20131231.csv
 
 # 3. Extract solar images (--keep-pdf is required for the label stage)
-./tools/extract_plots.sh extract --id 15004866 --keep-pdf
+./tools/extract_plots.sh extract --id 2620529 --keep-pdf
 # Output:
-#   Processing paper ID 15004866
+#   Processing paper ID 2620529
 #     Title     : White-light flares: a TRACE, RHESSI and SOHO/MDI multi-wavelength stu...
 #     Author    : Song, Y
-#     Output    : output/papers/2012-07 - Song, Y
+#     Output    : output/papers/2012-01 - Labrosse, N
 #   Found 5 embedded images in PDF
 #     [SOLAR] img-002 p3 1024x768 rgb  score=0.65 [aia_false_color_22%, ...]
 #     ...
 #   Extraction complete: 3/5 images classified as solar observations
 
 # 4. Label extracted images
-./tools/extract_plots.sh label --paper-dir "output/papers/2012-07 - Song, Y"
+./tools/extract_plots.sh label --paper-dir "output/papers/2012-01 - Labrosse, N"
 # Output:
-#   Labeling paper: 2012-07 - Song, Y
+#   Labeling paper: 2012-01 - Labrosse, N
 #     Title       : White-light flares: a TRACE, RHESSI and SOHO/MDI...
 #     First author: Song, Y
 #     Solar images: 3 / 5 extracted
-#     PDF copied  : output/papers/2012-07 - Song, Y.pdf
-#     Images dir  : output/images/2012-07 - Song, Y
+#     PDF copied  : output/papers/2012-01 - Labrosse, N.pdf
+#     Images dir  : output/images/2012-01 - Labrosse, N
 #     Extracting captions from PDF...
 #       Found 6 figure caption(s) across 4 page(s)
 #     Loading NLP model for structure classification...
 #   Labeling complete: 3 row(s) written
-#   CSV: output/labels/2012-07 - Song, Y.csv
+#   CSV: output/labels/2012-01 - Labrosse, N.csv
 
 # 5. Browse the output CSV
 cat output/labels/2012-07\ -\ Song,\ Y.csv
@@ -428,7 +428,7 @@ To see per-image caption matching and structure classification decisions, add `-
 
 ```bash
 ./tools/extract_plots.sh label \
-    --paper-dir "output/papers/2012-07 - Song, Y" \
+    --paper-dir "output/papers/2012-01 - Labrosse, N" \
     --verbose
 # solar_001 p3  caption="Figure 3"  [same_page]  → Flare (0.7821)
 # solar_002 p4  caption="Figure 4"  [same_page]  → Active Region (0.5130)

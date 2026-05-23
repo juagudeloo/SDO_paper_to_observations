@@ -14,13 +14,17 @@
 #     ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01 --format md --output papers
 #
 #   Extract images from a specific paper:
-#     ./tools/extract_plots.sh extract --id 15004866
-#     ./tools/extract_plots.sh extract --id 15004866 --output-dir ./output
-#     ./tools/extract_plots.sh extract --id 15004866 --source arxiv --keep-pdf
+#     ./tools/extract_plots.sh extract --id 2620529
+#     ./tools/extract_plots.sh extract --id 2620529 --output-dir ./output
+#     ./tools/extract_plots.sh extract --id 2620529 --source arxiv --keep-pdf
 #
 #   Label images with captions and solar structure:
 #     ./tools/extract_plots.sh label --paper-dir output/papers/2012-01\ -\ Labrosse,\ N
 #     ./tools/extract_plots.sh label --paper-dir output/papers/2012-01\ -\ Labrosse,\ N --output-dir output
+#
+#   Extract structured metadata from the same paper and hand it to Stage 2:
+#     ./tools/extract_plots.sh metadata --paper-dir output/papers/2012-01\ -\ Labrosse,\ N --output_dir output/metadata
+#     ./tools/extract_plots.sh query --metadata_dir output/metadata --fits_dir output/fits --output_dir output/matched
 #
 #   Run unit tests:
 #     ./tools/extract_plots.sh test
@@ -68,6 +72,8 @@ COMMANDS:
   list      List papers in a date range and save to CSV
   extract   Extract solar observation images from a specific paper
   label     Link extracted images to captions and classify solar structures
+  metadata  Stage 1 — extract structured observation metadata from PDFs via LLM
+  query     Stage 2 — query SDO/VSO archive and produce cropped submaps
   test      Run unit tests
 
 USAGE:
@@ -85,6 +91,15 @@ USAGE:
     ./tools/extract_plots.sh label --paper-dir PAPER_DIR \
         [--output-dir DIR] [--verbose]
 
+  metadata:
+    ./tools/extract_plots.sh metadata --pdf_dir DIR \
+        [--output_dir DIR] [--model Qwen/Qwen2.5-14B-Instruct]
+    ./tools/extract_plots.sh metadata --paper-dir DIR \
+        [--output_dir DIR] [--model Qwen/Qwen2.5-14B-Instruct]
+
+  query:
+    ./tools/extract_plots.sh query --metadata_dir DIR --fits_dir DIR [--output_dir DIR]
+
 EXAMPLES:
   # List papers from 2012-01-02 to 2013-03-01 (saves CSV + Markdown to output/searched_papers/)
   ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01
@@ -92,14 +107,23 @@ EXAMPLES:
   # Save only Markdown
   ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01 --format md
 
-  # Extract images from paper 15004866 (--keep-pdf required for the label stage)
-  ./tools/extract_plots.sh extract --id 15004866 --keep-pdf
+  # Extract images from the Labrosse paper (--keep-pdf required for later stages)
+  ./tools/extract_plots.sh extract --id 2620529 --keep-pdf
 
   # Extract with custom output directory
-  ./tools/extract_plots.sh extract --id 15004866 --output-dir ./my_output --keep-pdf
+  ./tools/extract_plots.sh extract --id 2620529 --output-dir ./my_output --keep-pdf
 
   # Label extracted images with captions and solar structure classification
   ./tools/extract_plots.sh label --paper-dir "output/papers/2012-01 - Labrosse, N"
+
+  # Stage 1: extract observation metadata from the Labrosse paper
+  ./tools/extract_plots.sh metadata --paper-dir "output/papers/2012-01 - Labrosse, N" --output_dir output/metadata
+
+  # Stage 2: query SDO/VSO and produce cropped submaps from Stage 1 metadata
+  ./tools/extract_plots.sh query \
+      --metadata_dir output/metadata/ \
+      --fits_dir output/fits/ \
+      --output_dir output/matched/
 
 ENVIRONMENT VARIABLES:
   SDO_API_URL   API base URL  (default: http://localhost:8000)
@@ -131,6 +155,26 @@ check_transformers() {
         echo "       Install with:" >&2
         echo "         conda activate $CONDA_ENV" >&2
         echo "         pip install transformers>=4.30.0" >&2
+        exit 1
+    fi
+}
+
+check_bitsandbytes() {
+    if ! conda run -n "$CONDA_ENV" python3 -c "import bitsandbytes" 2>/dev/null; then
+        echo "ERROR: 'bitsandbytes' is not installed in conda env '$CONDA_ENV'." >&2
+        echo "       Install with:" >&2
+        echo "         conda activate $CONDA_ENV" >&2
+        echo "         pip install bitsandbytes accelerate" >&2
+        exit 1
+    fi
+}
+
+check_sunpy() {
+    if ! conda run -n "$CONDA_ENV" python3 -c "import sunpy, astropy" 2>/dev/null; then
+        echo "ERROR: 'sunpy' or 'astropy' is not installed in conda env '$CONDA_ENV'." >&2
+        echo "       Install with:" >&2
+        echo "         conda activate $CONDA_ENV" >&2
+        echo "         pip install sunpy astropy" >&2
         exit 1
     fi
 }
@@ -174,6 +218,15 @@ case "$COMMAND" in
         check_transformers
         conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/label_plots.py" "$@"
         ;;
+    metadata)
+        check_transformers
+        check_bitsandbytes
+        conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/stage1_metadata_extraction.py" "$@"
+        ;;
+    query)
+        check_sunpy
+        conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/stage2_sdo_query.py" "$@"
+        ;;
     test)
         echo "Running unit tests in conda env '$CONDA_ENV' ..."
         conda run -n "$CONDA_ENV" python3 -m unittest discover \
@@ -183,7 +236,7 @@ case "$COMMAND" in
         ;;
     *)
         echo "ERROR: Unknown command '$COMMAND'." >&2
-        echo "       Use: list | extract | label | test" >&2
+        echo "       Use: list | extract | label | metadata | query | test" >&2
         echo "       Run './tools/extract_plots.sh --help' for usage." >&2
         exit 1
         ;;

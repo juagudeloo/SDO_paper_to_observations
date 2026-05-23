@@ -270,3 +270,98 @@ def match_image_to_caption(
 
     # 3. No caption found
     return (None, "none")
+
+
+# ---------------------------------------------------------------------------
+# Per-figure context builder (used by stage1_metadata_extraction)
+# ---------------------------------------------------------------------------
+
+# Matches inline figure citations in body text: "Fig. 2", "Figs. 2", "Figure 2a", etc.
+_FIG_BODY_REF_RE = re.compile(
+    r"\b(?:Figs?\.?\s*|Figures?\s+)(\d+[a-zA-Z]?)",
+    re.IGNORECASE,
+)
+
+# Extracts the trailing number+letter from a label like "Figure 2a" → "2a"
+_LABEL_NUM_RE = re.compile(r"(\d+[a-zA-Z]?)$")
+
+
+def extract_figure_body_refs(pdf_path: str) -> Dict[str, List[str]]:
+    """
+    Return a mapping from figure number to body paragraphs that cite it.
+
+    Scans all non-caption text blocks across the document. Any block containing
+    a reference such as "Fig. 2", "Figure 2a", or "Figs. 2 and 3" is collected
+    under each figure number found in that block.
+
+    Args:
+        pdf_path: Path to the PDF file.
+
+    Returns:
+        Dict mapping figure-number string (e.g. "2", "2a") → list of body
+        paragraph texts (whitespace-normalised, deduplicated, in document order).
+    """
+    if not _FITZ_AVAILABLE:
+        raise RuntimeError("PyMuPDF is required. Install with: pip install pymupdf")
+
+    refs: Dict[str, List[str]] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            for block in page.get_text("dict").get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                text = _assemble_block_text(block)
+                if not text or CAPTION_RE.match(text):
+                    continue
+                clean = " ".join(text.split())
+                for m in _FIG_BODY_REF_RE.finditer(clean):
+                    fig_num = m.group(1)
+                    bucket = refs.setdefault(fig_num, [])
+                    if clean not in bucket:
+                        bucket.append(clean)
+    finally:
+        doc.close()
+    return refs
+
+
+def build_figure_contexts(pdf_path: str) -> List[Dict]:
+    """
+    Build one context dict per figure combining its caption and body references.
+
+    For each figure caption found in the PDF, assembles the body-text paragraphs
+    that explicitly cite that figure number ("Fig. N", "Figure N", etc.) so the
+    LLM receives both the brief caption label and the richer observational
+    description from the main text.
+
+    Each returned dict has keys:
+      - ``figure_label``: e.g. "Figure 2"
+      - ``caption``: full caption text
+      - ``body_refs``: list of body paragraphs that reference this figure
+
+    Args:
+        pdf_path: Path to the PDF file.
+
+    Returns:
+        List of dicts sorted by page then vertical position, one per figure.
+        Returns an empty list if no figure captions are found.
+    """
+    captions_by_page = extract_all_captions(pdf_path)
+    if not captions_by_page:
+        return []
+
+    body_refs = extract_figure_body_refs(pdf_path)
+
+    contexts: List[Dict] = []
+    for page_num in sorted(captions_by_page.keys()):
+        for caption in captions_by_page[page_num]:
+            num_match = _LABEL_NUM_RE.search(caption.figure_label)
+            fig_num = num_match.group(1) if num_match else ""
+            contexts.append({
+                "figure_label": caption.figure_label,
+                "caption": caption.text,
+                "body_refs": body_refs.get(fig_num, []),
+            })
+
+    return contexts

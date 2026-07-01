@@ -114,10 +114,10 @@ EXAMPLES:
   ./tools/extract_plots.sh extract --id 2620529 --output-dir ./my_output --keep-pdf
 
   # Label extracted images with captions and solar structure classification
-  ./tools/extract_plots.sh label --paper-dir "output/papers/2012-01 - Labrosse, N"
+  ./tools/extract_plots.sh label --paper-dir "output/2012-01 - Labrosse, N"
 
   # Stage 1: extract observation metadata from the Labrosse paper
-  ./tools/extract_plots.sh metadata --paper-dir "output/papers/2012-01 - Labrosse, N" --output_dir output/metadata
+  ./tools/extract_plots.sh metadata --paper-dir "output/2012-01 - Labrosse, N" --output_dir output/metadata
 
   # Stage 2: query SDO/VSO and produce cropped submaps from Stage 1 metadata
   ./tools/extract_plots.sh query \
@@ -221,11 +221,11 @@ case "$COMMAND" in
     metadata)
         check_transformers
         check_bitsandbytes
-        conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/stage1_metadata_extraction.py" "$@"
+        conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/metadata_extraction.py" "$@"
         ;;
     query)
         check_sunpy
-        conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/stage2_sdo_query.py" "$@"
+        conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/sdo_query.py" "$@"
         ;;
     test)
         echo "Running unit tests in conda env '$CONDA_ENV' ..."

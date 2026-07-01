@@ -11,7 +11,6 @@ streams that poppler's pdfimages silently skips.
 import os
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +35,12 @@ class ImageMetadata:
     height: int             # Image height in pixels
     color_space: str        # 'rgb', 'cmyk', 'gray', etc.
     encoding: str           # 'jpeg', 'png', 'jp2', 'raw', etc.
-    file_path: Optional[str] = field(default=None)  # Set after extraction
+    file_path: str | None = field(default=None)  # Set after extraction
+    # Placement rectangle on the page in PDF points (x0, y0, x1, y1), origin
+    # top-left. Used downstream to match the image to its figure caption by
+    # vertical proximity without re-parsing the PDF. None if the image is
+    # embedded but not placed on any page.
+    bbox: tuple[float, float, float, float] | None = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +64,25 @@ def _colorspace_name(cs) -> str:
 # Image extraction
 # ---------------------------------------------------------------------------
 
-def extract_pdf_images(pdf_path: str, output_dir: str) -> List[ImageMetadata]:
+def _largest_image_bbox(page, xref: int) -> tuple[float, float, float, float] | None:
+    """
+    Return the placement rectangle of image `xref` on `page` as (x0, y0, x1, y1).
+
+    An xref can be placed multiple times on a page; the largest-area rect is the
+    one worth matching to a caption. Returns None if the image is not placed.
+    """
+    try:
+        rects = page.get_image_rects(xref)
+    except Exception as exc:
+        logger.debug("Could not get image rects for xref %d: %s", xref, exc)
+        return None
+    if not rects:
+        return None
+    biggest = max(rects, key=lambda r: r.get_area())
+    return (float(biggest.x0), float(biggest.y0), float(biggest.x1), float(biggest.y1))
+
+
+def extract_pdf_images(pdf_path: str, output_dir: str) -> list[ImageMetadata]:
     """
     Extract all embedded images from a PDF as PNG files using PyMuPDF.
 
@@ -90,7 +112,7 @@ def extract_pdf_images(pdf_path: str, output_dir: str) -> List[ImageMetadata]:
     os.makedirs(output_dir, exist_ok=True)
 
     doc = fitz.open(pdf_path)
-    metadata_list: List[ImageMetadata] = []
+    metadata_list: list[ImageMetadata] = []
     index = 0
 
     # Track xrefs already processed to avoid duplicates from shared XObjects
@@ -140,6 +162,7 @@ def extract_pdf_images(pdf_path: str, output_dir: str) -> List[ImageMetadata]:
                 color_space=cs_name,
                 encoding=ext,
                 file_path=file_path,
+                bbox=_largest_image_bbox(page, xref),
             ))
             index += 1
 

@@ -12,43 +12,59 @@ reproduce the matching observation as a cropped submap.
 
 ## Architecture
 
-The system is a **five-stage CLI pipeline**, not a notebook. Every stage is a `scripts/*.py`
+The system is a **four-stage CLI pipeline**, not a notebook. Every stage is a `scripts/*.py`
 program that imports shared logic from `utils/`, and all stages are dispatched through a single
 wrapper, `tools/extract_plots.sh`, which activates the conda env and validates dependencies per
-stage. Data flows through the `output/` tree, each stage consuming the previous stage's directory.
+stage. Data flows through a **canonical `output/` layout** keyed by the paper-name string; each
+stage after `extract` addresses a paper by that name (`--paper-name`) or processes them all
+(`--all`).
 
 | Stage | Command | Script | Consumes → Produces |
 |-------|---------|--------|---------------------|
-| 1 | `list`     | `list_papers.py`               | date range → `output/searched_papers/*.csv,*.md` |
-| 2 | `extract`  | `extract_plots.py`             | paper ID → `output/papers/<folder>/` (+ `extraction_log.json`) |
-| 3 | `label`    | `label_plots.py`               | paper dir → `output/images/`, `output/labels/*.csv` |
-| 4 | `metadata` | `stage1_metadata_extraction.py`| paper dir → `output/metadata/<paper>.json` |
-| 5 | `query`    | `stage2_sdo_query.py`          | metadata dir → `output/matched/` (cropped submap PNG + JSON) |
+| 1 | `list`     | `list_papers.py`         | date range → `output/searched_papers/*.csv,*.md` |
+| 2 | `extract`  | `extract_plots.py`       | paper ID → `output/images/<name>/*.png` + `extraction_log.json`, `output/papers/<name>.pdf` |
+| 3 | `metadata` | `metadata_extraction.py` | paper name → `output/metadata/<name>.json` |
+| 4 | `query`    | `sdo_query.py`           | paper name → `output/matched/` (cropped submap PNG + JSON), FITS cache in `output/fits/` |
+
+The canonical layout under the output root (default `output/`, set with `--output-dir`):
+
+```
+papers/    <name>.pdf                         (kept by extract unless --no-keep-pdf)
+images/    <name>/*.png + extraction_log.json (extract; log carries per-image bbox)
+metadata/  <name>.json                         (metadata)
+matched/   ...                                 (query)
+fits/      ...                                 (query FITS cache)
+failed/    ...                                 (failures)
+```
 
 Key cross-cutting design points a change is likely to touch:
 
 - **`utils/api_client.py` is the sole gateway to the external NASA ADS SDO API.** The API base
   URL comes from `SDO_API_URL` (default `http://localhost:8000`). Stages `list`/`extract` require
   it running; it lives in the sibling repo `../NASA_ADS_SDO` and is started with `./run_api.sh`.
-- **Folder naming is canonical and shared.** `utils/folder_naming.py` builds the
-  `YYYY-MM - LastName, F` folder name from paper metadata (the DB stores dates as `YYYY-MM-00`,
-  and its authors field is empty, so the first author is parsed out of the PDF's first-page text).
-  Every stage keys off this exact string, so changing the format breaks stage-to-stage lookup.
-- **Caption↔image matching is shared logic.** Both `label` and `metadata` match each extracted
-  image to the nearest figure caption by vertical proximity via `utils/caption_extractor.py`
-  (PyMuPDF/`fitz` text blocks + image bboxes). Stage 4 additionally pulls body-text paragraphs
-  that cite each figure (`extract_figure_body_refs`) to give the LLM more context.
-- **Two independent classifiers, different technologies.** `utils/solar_classifier.py` decides
-  *is this image a solar observation* using classical CV (Hough circles, HSV palette analysis,
-  HMI grayscale/texture heuristics; raw score ≥ 5 → solar). `utils/structure_classifier_nlp.py`
-  decides *what structure the caption describes* using zero-shot `facebook/bart-large-mnli`.
-- **Model cache is redirected into the repo.** Both the NLP classifier and Stage 4 set
-  `HF_HOME` to `models/` before importing `transformers`; the Qwen weights and BART model download
-  there, not to `~/.cache`.
-- **Stage 4 LLM:** `Qwen/Qwen2.5-14B-Instruct`, 8-bit quantised (needs `bitsandbytes` + GPU).
+- **Folder naming and the layout are canonical and shared.** `utils/folder_naming.py` builds the
+  `YYYY-MM - LastName, F` name from paper metadata (the DB stores dates as `YYYY-MM-00`, and its
+  authors field is empty, so the first author is parsed out of the PDF's first-page text), *and*
+  resolves every canonical path (`pdf_path`, `images_dir`, `log_path`, `metadata_json`,
+  `matched_dir`, `fits_dir`, plus `iter_paper_names` for `--all`). No stage hardcodes `output/...`
+  paths — changing the layout is a one-file change here.
+- **Image geometry is captured once, at extract.** `utils/pdf_extractor.py` records each image's
+  page-placement `bbox`; `extract_plots.py` writes it (with the saved PNG `filename`) into
+  `extraction_log.json`. Downstream `metadata` reads the bbox from the log and matches to the
+  nearest figure caption by vertical proximity via `utils/caption_extractor.py`
+  (`match_image_to_caption`) — it does **not** re-derive image bboxes from the PDF. It still opens
+  the PDF for caption text and for the body-text paragraphs that cite each figure
+  (`extract_figure_body_refs`), which feed the LLM.
+- **One classifier.** `utils/solar_classifier.py` decides *is this image a solar observation*
+  using classical CV (Hough circles, HSV palette analysis, HMI grayscale/texture heuristics; raw
+  score ≥ 5 → solar). The old zero-shot caption classifier (`structure_classifier_nlp.py`, BART)
+  was removed — the metadata LLM's `phenomenon` field supersedes it.
+- **Model cache is redirected into the repo.** `metadata_extraction.py` sets `HF_HOME` to
+  `models/` before importing `transformers`; the Qwen weights download there, not to `~/.cache`.
+- **Metadata LLM:** `Qwen/Qwen2.5-14B-Instruct`, 8-bit quantised (needs `bitsandbytes` + GPU).
   It reads caption + citing paragraphs per image and emits structured observation metadata.
-- **Stage 5 has three fallback strategies** (see `LIMB_BOXES` / strategy A/B/C in
-  `stage2_sdo_query.py`), degrading from explicit Heliprojective Tx/Ty + FOV (`high` confidence),
+- **`query` has three fallback strategies** (see `LIMB_BOXES` / strategy A/B/C in
+  `sdo_query.py`), degrading from explicit Heliprojective Tx/Ty + FOV (`high` confidence),
   to an approximate limb bounding box (`medium`), to a full-disk map for downstream CV (`low`).
 
 ## Commands
@@ -60,18 +76,14 @@ All work goes through the wrapper (it activates conda env `pytorch_jupyter` and 
 # Stage 1 — list papers in a date range
 ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01 [--format csv|md|both]
 
-# Stage 2 — extract solar images from one paper (use --keep-pdf; later stages need the PDF)
-./tools/extract_plots.sh extract --id 2620529 --keep-pdf [--source arxiv|publisher] [--min-score 0.25]
+# Stage 2 — extract solar images (PDF kept in output/papers/ by default; --no-keep-pdf to omit)
+./tools/extract_plots.sh extract --id 2620529 [--source arxiv|publisher] [--min-score 0.25]
 
-# Stage 3 — link images to captions + classify structure
-./tools/extract_plots.sh label --paper-dir "output/papers/2012-01 - Labrosse, N"
+# Stage 3 — extract observation metadata via LLM (one paper, or --all)
+./tools/extract_plots.sh metadata --paper-name "2012-01 - Labrosse, N"
 
-# Stage 4 — extract observation metadata via LLM
-./tools/extract_plots.sh metadata --paper-dir "output/papers/2012-01 - Labrosse, N" --output_dir output/metadata
-# (batch form: --pdf_dir output/papers/ processes every paper folder)
-
-# Stage 5 — query SDO/VSO and produce cropped submaps
-./tools/extract_plots.sh query --metadata_dir output/metadata/ --fits_dir output/fits/ --output_dir output/matched/
+# Stage 4 — query SDO/VSO and produce cropped submaps (one paper, or --all)
+./tools/extract_plots.sh query --all
 
 # Environment overrides
 SDO_API_URL=http://host:8000 CONDA_ENV=pytorch_jupyter ./tools/extract_plots.sh list ...
@@ -87,9 +99,10 @@ each script inserts the project root on `sys.path` so `from utils... import` wor
 
 - Conda env: **`pytorch_jupyter`** (override with `CONDA_ENV`).
 - Core: `pip install -r requirements_extract.txt` (numpy, Pillow, opencv-python, requests,
-  matplotlib, pymupdf, transformers).
-- Stage 4 additionally needs `bitsandbytes` + `accelerate` (8-bit quantisation, GPU).
-- Stage 5 additionally needs `sunpy` + `astropy` (VSO query, FITS, coordinate transforms).
+  matplotlib, pymupdf, transformers). `list`/`extract` need only these.
+- `metadata` additionally needs `bitsandbytes` + `accelerate` (8-bit quantisation, GPU) for the
+  Qwen LLM.
+- `query` additionally needs `sunpy` + `astropy` (VSO query, FITS, coordinate transforms).
 - The wrapper checks these per-stage and prints an install hint if missing.
 
 ## Documentation

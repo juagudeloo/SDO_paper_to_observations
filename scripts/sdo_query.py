@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-stage2_sdo_query.py — Query SDO/VSO archive and produce cropped submaps from Stage 1 metadata.
+sdo_query.py — Query SDO/VSO archive and produce cropped submaps from observation metadata.
 
-For each observation event produced by stage1_metadata_extraction.py, downloads
-the closest FITS file from the VSO, crops the map according to available coordinate
-metadata, and saves a normalised uint8 PNG alongside a companion JSON.
+For each observation event produced by metadata_extraction.py, downloads the closest
+FITS file from the VSO, crops the map according to available coordinate metadata, and
+saves a normalised uint8 PNG alongside a companion JSON under <root>/matched/.
 
 Strategies (in priority order):
   A — explicit Heliprojective Tx/Ty + FOV (confidence="high")
@@ -12,10 +12,9 @@ Strategies (in priority order):
   C — full-disk map saved for downstream CV matching (confidence="low")
 
 Usage:
-  python scripts/stage2_sdo_query.py \
-      --metadata_dir papers/metadata/ \
-      --fits_dir papers/sdo_fits/ \
-      --output_dir papers/matched/
+  python scripts/sdo_query.py --paper-name "2012-01 - Labrosse, N"
+  python scripts/sdo_query.py --all
+  python scripts/sdo_query.py --all --output-dir output --fits-dir output/fits
 """
 
 import argparse
@@ -23,11 +22,11 @@ import json
 import logging
 import os
 import re
+import sys
 import warnings
 from datetime import datetime, timedelta, timezone
 from glob import glob
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -38,6 +37,9 @@ from astropy.io.fits.verify import VerifyWarning
 import sunpy.map
 from sunpy.net import Fido, attrs as a
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils import folder_naming as fn
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Approximate Heliprojective bounding boxes for limb/disk positions (arcsec).
 # Each value is (min, max) for Tx and Ty.
-LIMB_BOXES: dict[str, Optional[dict[str, tuple[float, float]]]] = {
+LIMB_BOXES: dict[str, dict[str, tuple[float, float]] | None] = {
     "NW":   {"tx": (-800.0, -100.0), "ty": (200.0,   800.0)},
     "SW":   {"tx": (-800.0, -100.0), "ty": (-800.0, -200.0)},
     "NE":   {"tx": (100.0,   800.0), "ty": (200.0,   800.0)},
@@ -65,21 +67,21 @@ _SAFE_RE = re.compile(r"[^\w\-]")
 # Metadata loading
 # ---------------------------------------------------------------------------
 
-def load_all_events(
-    metadata_dir: str,
+def load_events(
+    json_paths: list[str],
 ) -> list[tuple[str, int, dict]]:
     """
-    Load all observation events from Stage 1 JSON files.
+    Load all observation events from a set of metadata JSON files.
 
     Args:
-        metadata_dir: Directory containing per-paper JSON files.
+        json_paths: Metadata JSON files to read.
 
     Returns:
         List of (paper_stem, event_index, observation_dict) tuples for
         every event in every successful paper record.
     """
     events: list[tuple[str, int, dict]] = []
-    for json_path in sorted(glob(os.path.join(metadata_dir, "*.json"))):
+    for json_path in sorted(json_paths):
         try:
             with open(json_path, encoding="utf-8") as fh:
                 record = json.load(fh)
@@ -129,7 +131,7 @@ def fetch_fits(
     obs: dict,
     fits_dir: str,
     cache_path: str,
-) -> Optional[str]:
+) -> str | None:
     """
     Download the closest FITS file from the VSO for an observation event.
 
@@ -191,7 +193,7 @@ def fetch_fits(
 # Map loading
 # ---------------------------------------------------------------------------
 
-def load_map(fits_path: str) -> Optional[sunpy.map.Map]:
+def load_map(fits_path: str) -> sunpy.map.Map | None:
     """
     Load a FITS file as a sunpy Map, suppressing non-standard header warnings.
 
@@ -410,25 +412,31 @@ def process_event(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stage 2: query SDO/VSO archive and produce cropped submaps."
+        description="Query SDO/VSO archive and produce cropped submaps from observation metadata."
     )
     parser.add_argument(
-        "--metadata_dir",
-        required=True,
-        metavar="DIR",
-        help="Directory containing Stage 1 JSON metadata files",
+        "--paper-name",
+        default=None,
+        metavar="NAME",
+        help="Canonical paper name to process (e.g. '2012-01 - Labrosse, N')",
     )
     parser.add_argument(
-        "--fits_dir",
-        required=True,
-        metavar="DIR",
-        help="Cache directory for downloaded FITS files",
+        "--all",
+        action="store_true",
+        help="Process every metadata JSON found under <root>/metadata/",
     )
     parser.add_argument(
-        "--output_dir",
+        "--output-dir",
         default="output",
         metavar="DIR",
-        help="Output directory for PNG images and companion JSONs (default: ./output)",
+        help="Root of the canonical output layout (default: output). Reads "
+             "metadata/, writes matched/.",
+    )
+    parser.add_argument(
+        "--fits-dir",
+        default=None,
+        metavar="DIR",
+        help="Cache directory for downloaded FITS files (default: <root>/fits)",
     )
     return parser.parse_args()
 
@@ -436,15 +444,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    os.makedirs(args.fits_dir, exist_ok=True)
-    os.makedirs(args.output_dir, exist_ok=True)
+    if not args.paper_name and not args.all:
+        print("ERROR: one of --paper-name or --all is required", file=sys.stderr)
+        sys.exit(1)
 
-    events = load_all_events(args.metadata_dir)
+    root = args.output_dir
+    fits_dir = args.fits_dir or fn.fits_dir(root)
+    output_dir = fn.matched_dir(root)
+    os.makedirs(fits_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Resolve which metadata JSON files to read
+    if args.paper_name:
+        json_paths = [fn.metadata_json(root, args.paper_name)]
+    else:
+        json_paths = glob(os.path.join(fn.metadata_dir(root), "*.json"))
+
+    events = load_events(json_paths)
     if not events:
-        print(f"No events found in {args.metadata_dir}")
+        print(f"No events found in {fn.metadata_dir(root)}")
         return
 
-    print(f"Loaded {len(events)} observation event(s) from {args.metadata_dir}")
+    print(f"Loaded {len(events)} observation event(s) from {fn.metadata_dir(root)}")
 
     counts: dict[str, int] = {
         "skipped": 0,
@@ -457,7 +478,7 @@ def main() -> None:
     for paper_stem, event_idx, obs in events:
         label = f"{paper_stem} [{event_idx:03d}]"
         status = process_event(
-            paper_stem, event_idx, obs, args.fits_dir, args.output_dir
+            paper_stem, event_idx, obs, fits_dir, output_dir
         )
         counts[status] = counts.get(status, 0) + 1
 

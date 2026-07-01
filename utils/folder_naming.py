@@ -1,12 +1,15 @@
 """
-folder_naming.py — Build output folder names from paper metadata.
+folder_naming.py — Build output folder names and canonical paths from paper metadata.
 
 Handles:
 - Publication date formatting (DB uses YYYY-MM-00 with day always 00)
 - First-author name extraction from PDF text (DB authors field is empty)
 - Filesystem-safe folder name construction
+- The canonical `output/` layout every stage keys off (papers/, images/,
+  metadata/, matched/, failed/), addressed by the paper-name string.
 """
 
+import os
 import re
 import logging
 
@@ -185,3 +188,80 @@ def build_folder_name(
     # Collapse multiple spaces
     folder = re.sub(r" {2,}", " ", folder).strip()
     return folder
+
+
+# ---------------------------------------------------------------------------
+# Canonical output layout
+# ---------------------------------------------------------------------------
+#
+# Every stage after `extract` addresses a paper by its canonical name
+# ('YYYY-MM - LastName, F') and resolves its artifacts through these helpers,
+# so the layout lives in exactly one place:
+#
+#   <root>/papers/<name>.pdf                      (kept PDF)
+#   <root>/images/<name>/*.png                    (solar images)
+#   <root>/images/<name>/extraction_log.json      (per-image log incl. bbox)
+#   <root>/metadata/<name>.json                   (observation metadata)
+#   <root>/matched/                               (cropped submaps)
+#   <root>/failed/                                (failures)
+
+LOG_FILENAME = "extraction_log.json"
+
+
+def papers_dir(root: str) -> str:
+    return os.path.join(root, "papers")
+
+
+def images_root(root: str) -> str:
+    return os.path.join(root, "images")
+
+
+def metadata_dir(root: str) -> str:
+    return os.path.join(root, "metadata")
+
+
+def matched_dir(root: str) -> str:
+    return os.path.join(root, "matched")
+
+
+def fits_dir(root: str) -> str:
+    return os.path.join(root, "fits")
+
+
+def pdf_path(root: str, name: str) -> str:
+    """Canonical PDF path: <root>/papers/<name>.pdf"""
+    return os.path.join(papers_dir(root), f"{name}.pdf")
+
+
+def images_dir(root: str, name: str) -> str:
+    """Canonical per-paper image directory: <root>/images/<name>/"""
+    return os.path.join(images_root(root), name)
+
+
+def log_path(root: str, name: str) -> str:
+    """Canonical extraction log: <root>/images/<name>/extraction_log.json"""
+    return os.path.join(images_dir(root, name), LOG_FILENAME)
+
+
+def metadata_json(root: str, name: str) -> str:
+    """Canonical metadata output: <root>/metadata/<name>.json"""
+    return os.path.join(metadata_dir(root), f"{name}.json")
+
+
+def iter_paper_names(root: str) -> list[str]:
+    """
+    List canonical paper names available under a root, sorted.
+
+    The source of truth is <root>/images/<name>/ — a paper exists once `extract`
+    has produced its image directory. Used by the `--all` batch mode of the
+    downstream stages.
+    """
+    img_root = images_root(root)
+    if not os.path.isdir(img_root):
+        return []
+    names = [
+        entry
+        for entry in os.listdir(img_root)
+        if os.path.isdir(os.path.join(img_root, entry))
+    ]
+    return sorted(names)

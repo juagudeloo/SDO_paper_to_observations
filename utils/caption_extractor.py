@@ -171,58 +171,13 @@ def extract_all_captions(pdf_path: str) -> Dict[int, List[Caption]]:
 
 
 # ---------------------------------------------------------------------------
-# Image bounding-box extraction
-# ---------------------------------------------------------------------------
-
-def get_all_image_bboxes(pdf_path: str) -> Dict[int, List[Tuple[int, "fitz.Rect"]]]:
-    """
-    Scan every page and collect the bounding box of each embedded image.
-
-    Mirrors the xref-deduplication logic of extract_pdf_images() so that the
-    positional order of results matches the extraction log's index order.
-
-    Args:
-        pdf_path: Path to the PDF file.
-
-    Returns:
-        Dict mapping 1-based page number → list of (xref, fitz.Rect) in
-        encounter order (same order as page.get_images(full=True)).
-    """
-    if not _FITZ_AVAILABLE:
-        raise RuntimeError("PyMuPDF is required. Install with: pip install pymupdf")
-
-    bboxes_by_page: Dict[int, List[Tuple[int, "fitz.Rect"]]] = {}
-    seen_xrefs: set = set()
-
-    doc = fitz.open(pdf_path)
-    try:
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            page_number = page_num + 1
-
-            for img_info in page.get_images(full=True):
-                xref = img_info[0]
-                if xref in seen_xrefs:
-                    continue
-                seen_xrefs.add(xref)
-
-                rects = page.get_image_rects(xref)
-                if not rects:
-                    continue
-                rect = rects[0]
-                if rect.is_empty:
-                    continue
-
-                bboxes_by_page.setdefault(page_number, []).append((xref, rect))
-    finally:
-        doc.close()
-
-    return bboxes_by_page
-
-
-# ---------------------------------------------------------------------------
 # Image-to-caption matching
 # ---------------------------------------------------------------------------
+#
+# Note: image page-placement bboxes are captured once, at extract time, by
+# utils/pdf_extractor.py and stored in extraction_log.json. Downstream stages
+# read them from the log and pass them to match_image_to_caption() below — they
+# do not re-derive image bboxes from the PDF.
 
 def match_image_to_caption(
     img_page: int,
@@ -273,7 +228,7 @@ def match_image_to_caption(
 
 
 # ---------------------------------------------------------------------------
-# Per-figure context builder (used by stage1_metadata_extraction)
+# Per-figure context builder (used by metadata_extraction)
 # ---------------------------------------------------------------------------
 
 # Matches inline figure citations in body text: "Fig. 2", "Figs. 2", "Figure 2a", etc.

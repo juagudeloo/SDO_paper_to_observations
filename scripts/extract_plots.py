@@ -5,15 +5,21 @@ extract_plots.py — Download a paper PDF and extract solar observation images.
 Given a paper ID from the NASA ADS SDO database:
   1. Fetch document metadata from the API.
   2. Download the PDF.
-  3. Extract all embedded images via pdfimages.
+  3. Extract all embedded images (with their page placement bbox).
   4. Classify each image as a solar observation or not.
-  5. Save solar images to: output_dir/YYYY-MM - LastName, F/
-  6. Write an extraction_log.json with full classification details.
+  5. Lay down the canonical output layout, keyed by the paper name
+     'YYYY-MM - LastName, F':
+       <root>/images/<name>/*.png                   (solar images)
+       <root>/images/<name>/extraction_log.json     (per-image log, incl. bbox)
+       <root>/papers/<name>.pdf                      (kept unless --no-keep-pdf)
+
+The bbox recorded per image lets the downstream `metadata` stage match each
+image to its figure caption without re-parsing the PDF.
 
 Usage:
   python3 extract_plots.py --id 2620529
   python3 extract_plots.py --id 2620529 --output-dir ./output --source arxiv
-  python3 extract_plots.py --id 2620529 --keep-pdf --min-score 0.25
+  python3 extract_plots.py --id 2620529 --no-keep-pdf --min-score 0.25
 """
 
 import argparse
@@ -28,6 +34,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from utils.api_client import check_api_health, get_api_base_url, get_document_by_id, download_pdf
+from utils import folder_naming as fn
 from utils.folder_naming import build_folder_name, parse_first_author
 from utils.pdf_extractor import extract_pdf_images, extract_first_page_text
 from utils.solar_classifier import classify_image
@@ -69,10 +76,13 @@ def parse_args() -> argparse.Namespace:
         help="Preferred PDF source (default: auto, tries arXiv then publisher)",
     )
     parser.add_argument(
-        "--keep-pdf",
-        action="store_true",
-        help="Keep the downloaded PDF and extracted PNGs in a temp folder",
+        "--no-keep-pdf",
+        dest="keep_pdf",
+        action="store_false",
+        help="Do not copy the PDF into <root>/papers/ (later stages need it, so"
+             " it is kept by default)",
     )
+    parser.set_defaults(keep_pdf=True)
     parser.add_argument(
         "--save-all",
         action="store_true",
@@ -142,13 +152,13 @@ def main() -> None:
         )
         print(f"  Author    : {last_name}, {first_initial}")
 
-        # --- 4. Build output folder ---
+        # --- 4. Build canonical output layout ---
         folder_name = build_folder_name(
             doc.get("publication_date", "0000-00-00"),
             last_name,
             first_initial,
         )
-        output_folder = os.path.join(args.output_dir, folder_name)
+        output_folder = fn.images_dir(args.output_dir, folder_name)
         os.makedirs(output_folder, exist_ok=True)
         print(f"  Output    : {output_folder}")
 
@@ -165,6 +175,7 @@ def main() -> None:
             entry = {
                 "index": img_meta.index,
                 "page": img_meta.page,
+                "bbox": list(img_meta.bbox) if img_meta.bbox else None,
                 "size": f"{img_meta.width}x{img_meta.height}",
                 "color_space": img_meta.color_space,
                 "encoding": img_meta.encoding,
@@ -172,6 +183,7 @@ def main() -> None:
                 "score": round(result.score, 3),
                 "signals": result.signals,
                 "image_type": result.image_type,
+                "filename": None,  # set below for images that get saved
             }
             log_entries.append(entry)
 
@@ -191,12 +203,12 @@ def main() -> None:
             )
 
             if keep:
-                solar_images.append((img_meta, result))
+                solar_images.append((img_meta, result, entry))
 
         # --- 7. Save solar images ---
         saved_count = 0
         img_prefix = "img" if args.save_all else "solar"
-        for i, (img_meta, result) in enumerate(solar_images):
+        for i, (img_meta, result, entry) in enumerate(solar_images):
             dest_name = (
                 f"{img_prefix}_{i + 1:03d}"
                 f"_p{img_meta.page}"
@@ -205,6 +217,7 @@ def main() -> None:
             dest_path = os.path.join(output_folder, dest_name)
             if img_meta.file_path and os.path.isfile(img_meta.file_path):
                 shutil.copy(img_meta.file_path, dest_path)
+                entry["filename"] = dest_name
                 saved_count += 1
                 print(f"  Saved: {dest_name}")
             else:
@@ -228,8 +241,8 @@ def main() -> None:
             "min_score_threshold": args.min_score,
             "images": log_entries,
         }
-        log_path = os.path.join(output_folder, "extraction_log.json")
-        with open(log_path, "w", encoding="utf-8") as fh:
+        log_file = fn.log_path(args.output_dir, folder_name)
+        with open(log_file, "w", encoding="utf-8") as fh:
             json.dump(log_data, fh, indent=2, ensure_ascii=False)
 
         mode_label = "saved (no filter)" if args.save_all else "classified as solar observations"
@@ -237,11 +250,12 @@ def main() -> None:
             f"\nExtraction complete: {saved_count}/{len(image_list)} images {mode_label}"
         )
         print(f"Output folder: {output_folder}")
-        print(f"Log: {log_path}")
+        print(f"Log: {log_file}")
 
-        # --- Keep or clean up temp files ---
+        # --- Keep the PDF in the canonical papers/ dir (needed by later stages) ---
         if args.keep_pdf:
-            dest_pdf = os.path.join(output_folder, f"paper_{args.id}.pdf")
+            dest_pdf = fn.pdf_path(args.output_dir, folder_name)
+            os.makedirs(os.path.dirname(dest_pdf), exist_ok=True)
             shutil.copy(pdf_path, dest_pdf)
             print(f"PDF kept at: {dest_pdf}")
         shutil.rmtree(tmp_dir, ignore_errors=True)

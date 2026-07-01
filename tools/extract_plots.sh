@@ -3,28 +3,30 @@
 # tools/extract_plots.sh — SDO Plot Extraction Pipeline
 # =============================================================================
 #
-# Entry point for the three-stage pipeline that:
+# Entry point for the four-stage pipeline that:
 #   1. Lists SDO papers from the NASA ADS SDO API in a date range (-> CSV + Markdown)
-#   2. Downloads a paper PDF and extracts solar observation images
-#   3. Links extracted images to figure captions and classifies solar structures
+#   2. Downloads a paper PDF and extracts solar observation images into the
+#      canonical output layout (images/, papers/)
+#   3. Extracts observation metadata (time, wavelength, coordinates) via an LLM
+#   4. Queries the SDO/VSO archive and produces cropped submaps
 #
 # USAGE
 #   List papers:
 #     ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01
 #     ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01 --format md --output papers
 #
-#   Extract images from a specific paper:
+#   Extract images from a specific paper (PDF kept in papers/ by default):
 #     ./tools/extract_plots.sh extract --id 2620529
 #     ./tools/extract_plots.sh extract --id 2620529 --output-dir ./output
-#     ./tools/extract_plots.sh extract --id 2620529 --source arxiv --keep-pdf
+#     ./tools/extract_plots.sh extract --id 2620529 --source arxiv --no-keep-pdf
 #
-#   Label images with captions and solar structure:
-#     ./tools/extract_plots.sh label --paper-dir output/papers/2012-01\ -\ Labrosse,\ N
-#     ./tools/extract_plots.sh label --paper-dir output/papers/2012-01\ -\ Labrosse,\ N --output-dir output
+#   Extract observation metadata (one paper, or all):
+#     ./tools/extract_plots.sh metadata --paper-name "2012-01 - Labrosse, N"
+#     ./tools/extract_plots.sh metadata --all
 #
-#   Extract structured metadata from the same paper and hand it to Stage 2:
-#     ./tools/extract_plots.sh metadata --paper-dir output/papers/2012-01\ -\ Labrosse,\ N --output_dir output/metadata
-#     ./tools/extract_plots.sh query --metadata_dir output/metadata --fits_dir output/fits --output_dir output/matched
+#   Query SDO/VSO and produce cropped submaps:
+#     ./tools/extract_plots.sh query --paper-name "2012-01 - Labrosse, N"
+#     ./tools/extract_plots.sh query --all
 #
 #   Run unit tests:
 #     ./tools/extract_plots.sh test
@@ -36,7 +38,8 @@
 # PREREQUISITES
 #   - Conda environment 'pytorch_jupyter' with: cv2, requests, PIL, numpy
 #   - pymupdf      (pip install pymupdf)
-#   - transformers (pip install transformers>=4.30.0)  [required for label stage]
+#   - transformers + bitsandbytes  [required for the metadata stage LLM]
+#   - sunpy + astropy              [required for the query stage]
 #   - NASA ADS SDO API running:
 #       cd ../NASA_ADS_SDO && ./run_api.sh
 # =============================================================================
@@ -70,10 +73,9 @@ SDO Plot Extraction Pipeline
 
 COMMANDS:
   list      List papers in a date range and save to CSV
-  extract   Extract solar observation images from a specific paper
-  label     Link extracted images to captions and classify solar structures
-  metadata  Stage 1 — extract structured observation metadata from PDFs via LLM
-  query     Stage 2 — query SDO/VSO archive and produce cropped submaps
+  extract   Extract solar observation images into the canonical output layout
+  metadata  Extract structured observation metadata from a paper via LLM
+  query     Query SDO/VSO archive and produce cropped submaps
   test      Run unit tests
 
 USAGE:
@@ -84,21 +86,16 @@ USAGE:
   extract:
     ./tools/extract_plots.sh extract --id PAPER_ID \
         [--output-dir DIR] [--api-url URL] \
-        [--source arxiv|publisher] [--keep-pdf] \
+        [--source arxiv|publisher] [--no-keep-pdf] \
         [--save-all] [--min-score 0.25] [--verbose]
 
-  label:
-    ./tools/extract_plots.sh label --paper-dir PAPER_DIR \
-        [--output-dir DIR] [--verbose]
-
   metadata:
-    ./tools/extract_plots.sh metadata --pdf_dir DIR \
-        [--output_dir DIR] [--model Qwen/Qwen2.5-14B-Instruct]
-    ./tools/extract_plots.sh metadata --paper-dir DIR \
-        [--output_dir DIR] [--model Qwen/Qwen2.5-14B-Instruct]
+    ./tools/extract_plots.sh metadata (--paper-name NAME | --all) \
+        [--output-dir DIR] [--model Qwen/Qwen2.5-14B-Instruct]
 
   query:
-    ./tools/extract_plots.sh query --metadata_dir DIR --fits_dir DIR [--output_dir DIR]
+    ./tools/extract_plots.sh query (--paper-name NAME | --all) \
+        [--output-dir DIR] [--fits-dir DIR]
 
 EXAMPLES:
   # List papers from 2012-01-02 to 2013-03-01 (saves CSV + Markdown to output/searched_papers/)
@@ -107,23 +104,17 @@ EXAMPLES:
   # Save only Markdown
   ./tools/extract_plots.sh list --start 2012-01-02 --end 2013-03-01 --format md
 
-  # Extract images from the Labrosse paper (--keep-pdf required for later stages)
-  ./tools/extract_plots.sh extract --id 2620529 --keep-pdf
+  # Extract images from the Labrosse paper (PDF kept in output/papers/ by default)
+  ./tools/extract_plots.sh extract --id 2620529
 
-  # Extract with custom output directory
-  ./tools/extract_plots.sh extract --id 2620529 --output-dir ./my_output --keep-pdf
+  # Extract with a custom output root
+  ./tools/extract_plots.sh extract --id 2620529 --output-dir ./my_output
 
-  # Label extracted images with captions and solar structure classification
-  ./tools/extract_plots.sh label --paper-dir "output/2012-01 - Labrosse, N"
+  # Extract observation metadata from the Labrosse paper
+  ./tools/extract_plots.sh metadata --paper-name "2012-01 - Labrosse, N"
 
-  # Stage 1: extract observation metadata from the Labrosse paper
-  ./tools/extract_plots.sh metadata --paper-dir "output/2012-01 - Labrosse, N" --output_dir output/metadata
-
-  # Stage 2: query SDO/VSO and produce cropped submaps from Stage 1 metadata
-  ./tools/extract_plots.sh query \
-      --metadata_dir output/metadata/ \
-      --fits_dir output/fits/ \
-      --output_dir output/matched/
+  # Query SDO/VSO and produce cropped submaps for every processed paper
+  ./tools/extract_plots.sh query --all
 
 ENVIRONMENT VARIABLES:
   SDO_API_URL   API base URL  (default: http://localhost:8000)
@@ -214,10 +205,6 @@ case "$COMMAND" in
     extract)
         conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/extract_plots.py" "$@"
         ;;
-    label)
-        check_transformers
-        conda run -n "$CONDA_ENV" python3 "$SCRIPTS_DIR/label_plots.py" "$@"
-        ;;
     metadata)
         check_transformers
         check_bitsandbytes
@@ -236,7 +223,7 @@ case "$COMMAND" in
         ;;
     *)
         echo "ERROR: Unknown command '$COMMAND'." >&2
-        echo "       Use: list | extract | label | metadata | query | test" >&2
+        echo "       Use: list | extract | metadata | query | test" >&2
         echo "       Run './tools/extract_plots.sh --help' for usage." >&2
         exit 1
         ;;

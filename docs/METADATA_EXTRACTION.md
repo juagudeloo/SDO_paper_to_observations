@@ -1,6 +1,6 @@
 # METADATA_EXTRACTION — Pipeline Documentation
 
-Step-by-step explanation of the automated solar observation metadata extraction pipeline (Stage 1: `metadata`).
+Step-by-step explanation of the automated solar observation metadata extraction stage (`metadata`).
 
 ---
 
@@ -9,7 +9,7 @@ Step-by-step explanation of the automated solar observation metadata extraction 
 1. [Overview](#overview)
 2. [Prerequisites](#prerequisites)
 3. [Pipeline Structure](#pipeline-structure)
-4. [Stage 1: Extract Metadata (`metadata`)](#stage-1-extract-metadata)
+4. [The Metadata Stage (`metadata`)](#the-metadata-stage)
 5. [Model Loading and Quantization](#model-loading-and-quantization)
 6. [HuggingFace Model Cache](#huggingface-model-cache)
 7. [Inference Pipeline](#inference-pipeline)
@@ -22,24 +22,34 @@ Step-by-step explanation of the automated solar observation metadata extraction 
 
 ## Overview
 
-The `metadata` stage processes paper directories produced by the `extract` stage and uses a locally-hosted large language model (Qwen2.5-14B-Instruct, 8-bit quantized) to extract structured observation metadata. Unlike a whole-paper approach, the pipeline works **per solar image**: each extracted image is matched to its nearest figure caption and the body paragraphs that cite it, and the LLM is asked to extract observation metadata from that focused context alone. The result is one JSON file per paper listing every solar observation image with its metadata.
+The `metadata` stage consumes the canonical output layout produced by `extract` and uses a
+locally-hosted large language model (Qwen2.5-14B-Instruct, 8-bit quantized) to extract
+structured observation metadata. It works **per solar image**: each image is matched to its
+nearest figure caption and the body paragraphs that cite it, and the LLM is asked to extract
+observation metadata from that focused context alone. The result is one JSON file per paper
+listing every solar observation image with its metadata.
 
 ```
-output/papers/
-    └── 2012-01 - Labrosse, N/
-        ├── extraction_log.json     ← produced by the extract stage
-        ├── paper_2620529.pdf
-        ├── solar_001_p3_aia_false_color.png
-        └── solar_002_p3_aia_false_color.png
+output/images/2012-01 - Labrosse, N/
+    ├── extraction_log.json      ← produced by extract (each image: page + bbox + filename)
+    ├── solar_001_p3_aia_false_color.png
+    └── solar_002_p3_aia_false_color.png
+output/papers/2012-01 - Labrosse, N.pdf   ← produced by extract (kept by default)
                     │
               (metadata stage)
                     │
                     ▼
-output/metadata/
-    └── 2012-01 - Labrosse, N.json
+output/metadata/2012-01 - Labrosse, N.json
 ```
 
-The stage is fully resumable: re-running skips any paper whose JSON file already exists in the output directory.
+Papers are addressed by their canonical **name** (`--paper-name "2012-01 - Labrosse, N"`) or
+processed in bulk (`--all`). The stage is fully resumable: re-running skips any paper whose
+JSON already exists.
+
+A key property: because `extract` already recorded each image's page-placement `bbox` in the
+log, this stage does **not** re-derive image geometry from the PDF. It reads the bbox from the
+log and only opens the PDF for caption text and citing paragraphs. See
+`docs/IMAGE_CAPTION_PIPELINE.md` for the matching mechanism.
 
 ---
 
@@ -63,15 +73,15 @@ python3 -c "import torch; print(torch.cuda.get_device_name(0))"
 pip install bitsandbytes accelerate
 ```
 
-### 3. HuggingFace Transformers (already required by `label`)
+### 3. HuggingFace Transformers
 
 ```bash
 pip install transformers>=4.30.0
 ```
 
-### 4. PyMuPDF (already required by `extract` and `label`)
+### 4. PyMuPDF (already required by `extract`)
 
-Used for caption extraction and image bounding-box lookup:
+Used for caption and body-text extraction:
 
 ```bash
 pip install pymupdf
@@ -79,7 +89,7 @@ pip install pymupdf
 
 ### 5. HuggingFace Hub access (first run only)
 
-The Qwen2.5-14B-Instruct model weights (~14 GB) are downloaded from HuggingFace Hub on the first run and cached locally in the project's `models/` directory (see [HuggingFace Model Cache](#huggingface-model-cache)). Subsequent runs use the cache.
+The Qwen2.5-14B-Instruct weights (~14 GB) are downloaded from HuggingFace Hub on the first run and cached in the project's `models/` directory (see [HuggingFace Model Cache](#huggingface-model-cache)). Subsequent runs use the cache.
 
 If the cluster has no internet access, pre-download the model on a machine with internet:
 ```bash
@@ -98,84 +108,81 @@ The shell script activates this environment automatically. It already has `torch
 
 ```
 tools/
-└── extract_plots.sh                 # Shell entry point (validates env, dispatches)
+└── extract_plots.sh              # Shell entry point (validates env, dispatches)
 
 scripts/
-├── stage1_metadata_extraction.py    # Stage 1 orchestrator
-└── label_plots.py                   # Shares caption-matching logic (same approach)
+└── metadata_extraction.py        # Stage orchestrator
 
 utils/
-├── caption_extractor.py             # extract_all_captions(), get_all_image_bboxes(),
-│                                    # match_image_to_caption(), extract_figure_body_refs()
-└── structure_classifier_nlp.py      # classify_structure() — NLP fallback for phenomenon/confidence
+├── folder_naming.py              # canonical paths: log_path(), pdf_path(),
+│                                 # metadata_json(), iter_paper_names()
+└── caption_extractor.py          # extract_all_captions(), match_image_to_caption(),
+                                  # extract_figure_body_refs()
 
-models/                              # HuggingFace model cache (HF_HOME)
+models/                           # HuggingFace model cache (HF_HOME)
 └── hub/
-    ├── models--Qwen--Qwen2.5-14B-Instruct/
-    └── models--facebook--bart-large-mnli/
+    └── models--Qwen--Qwen2.5-14B-Instruct/
 ```
 
-The shell script validates that `bitsandbytes` and `transformers` are importable before dispatching to `scripts/stage1_metadata_extraction.py`. All PDF text extraction is handled by `utils/caption_extractor.py` (the same utility used by `label_plots.py`).
+The shell script validates that `bitsandbytes` and `transformers` are importable before dispatching to `scripts/metadata_extraction.py`. All PDF text extraction is handled by `utils/caption_extractor.py`.
 
 ---
 
-## Stage 1: Extract Metadata
+## The Metadata Stage
 
 **Command (single paper):**
 ```bash
-./tools/extract_plots.sh metadata \
-    --paper_dir "output/papers/2012-01 - Labrosse, N" \
-    --output_dir output/metadata/
+./tools/extract_plots.sh metadata --paper-name "2012-01 - Labrosse, N"
 ```
 
 **Command (all papers):**
 ```bash
-./tools/extract_plots.sh metadata \
-    --pdf_dir output/papers/ \
-    --output_dir output/metadata/
+./tools/extract_plots.sh metadata --all
 ```
 
-**Implemented in:** `scripts/stage1_metadata_extraction.py`
+Both accept `--output-dir DIR` (the canonical output root, default `output`) and `--model MODEL`.
+
+**Implemented in:** `scripts/metadata_extraction.py`
 
 **What it does, step by step:**
 
-### Step 1: Collect paper directories
-**Implemented in:** `main()` — `scripts/stage1_metadata_extraction.py`
+### Step 1: Collect paper names
+**Implemented in:** `main()` — `scripts/metadata_extraction.py`
 
-- With `--paper_dir`: the single given directory is used directly.
-- With `--pdf_dir`: the script calls `os.scandir()` on the given parent directory and collects all subdirectories that contain an `extraction_log.json`. This mirrors how `label_plots.py` discovers paper folders and avoids accidentally processing unrelated directories.
+- With `--paper-name`: the single given name is used.
+- With `--all`: `folder_naming.iter_paper_names(root)` lists every paper under `<root>/images/` (the presence of an image directory is the source of truth for "a paper exists").
 
 ### Step 2: Check for existing output (resumability)
-**Implemented in:** `process_paper_dir()` — `scripts/stage1_metadata_extraction.py`
+**Implemented in:** `process_paper()` — `scripts/metadata_extraction.py`
 
-The output JSON path is derived as `<output_dir>/<folder_name>.json` (where `folder_name` is the paper directory's basename, e.g. `2012-01 - Labrosse, N`). If that file already exists, `process_paper_dir()` returns `"skipped"` immediately without loading the model or reading any files. This makes the stage safe to re-run after a crash or partial batch.
+The output path is `folder_naming.metadata_json(root, name)` → `<root>/metadata/<name>.json`. If that file already exists, `process_paper()` returns `"skipped"` immediately without loading the model or reading any files. This makes the stage safe to re-run after a crash or partial batch.
 
-### Step 3: Load extraction log and find the PDF
-**Functions:** `_load_extraction_log()`, `_find_pdf()` — `scripts/stage1_metadata_extraction.py`
+### Step 3: Load the extraction log and locate the PDF
+**Functions:** `_load_log()` — `scripts/metadata_extraction.py`; `folder_naming.pdf_path()`
 
-Reads `extraction_log.json` from the paper directory for the solar image list, paper title, and first author. Also finds `paper_*.pdf` inside the same directory for the full-text extraction steps below.
+Reads `<root>/images/<name>/extraction_log.json` for the solar image list (each entry carrying `page`, `bbox`, `image_type`, `filename`, …), paper title, and first author. The PDF is looked up at its canonical location `<root>/papers/<name>.pdf`; if it is missing (e.g. `extract` was run with `--no-keep-pdf`), the paper is written out with `status="failed"`.
 
 The author string is resolved in order of priority:
 1. PDF document metadata (`fitz.open(pdf_path).metadata["author"]`)
 2. `first_author` field from `extraction_log.json`
 
-### Step 4: Extract captions, image bboxes, and body references from the PDF
-**Functions:** `extract_all_captions()`, `get_all_image_bboxes()`, `extract_figure_body_refs()` — `utils/caption_extractor.py`
+### Step 4: Extract captions and body references from the PDF
+**Functions:** `extract_all_captions()`, `extract_figure_body_refs()` — `utils/caption_extractor.py`
 
-Three separate passes over the PDF are run once per paper (not once per image):
+Two passes over the PDF are run once per paper (not once per image):
 
 1. **`extract_all_captions(pdf_path)`** — scans every text block across all pages and identifies figure captions by the pattern `^(Figure|Fig\.)\s*\d+[a-z]?[.:\s]`. Returns a page-keyed dict of `Caption` objects (each with `figure_label`, full `text`, 1-based page number, and bounding box). Multi-block captions (captions split across consecutive text blocks) are merged automatically.
 
-2. **`get_all_image_bboxes(pdf_path)`** — scans every page for embedded images (using `page.get_images(full=True)`), deduplicating by xref, and returns the bounding rectangle (`fitz.Rect`) of each image in global encounter order. This order matches the `index` field in `extraction_log.json`, so an image's bbox can be looked up directly by its index.
+2. **`extract_figure_body_refs(pdf_path)`** — scans all non-caption text blocks and finds paragraphs that contain an inline figure citation such as `"Fig. 2"`, `"Figure 2a"`, or `"Figs. 2 and 3"` (matched by `\b(?:Figs?\.?\s*|Figures?\s+)(\d+[a-zA-Z]?)`). Returns a dict mapping figure number string (e.g. `"2"`, `"2a"`) to a deduplicated list of paragraph texts in document order.
 
-3. **`extract_figure_body_refs(pdf_path)`** — scans all non-caption text blocks and finds paragraphs that contain an inline figure citation such as `"Fig. 2"`, `"Figure 2a"`, or `"Figs. 2 and 3"` (matched by `\b(?:Figs?\.?\s*|Figures?\s+)(\d+[a-zA-Z]?)`). Returns a dict mapping figure number string (e.g. `"2"`, `"2a"`) to a deduplicated list of paragraph texts in document order.
+Image bounding boxes are **not** re-derived here — they come from the log (Step 5).
 
 ### Step 5: Match each solar image to its caption and body paragraphs
-**Functions:** `match_image_to_caption()` — `utils/caption_extractor.py`; `_build_global_bbox_list()` — `scripts/stage1_metadata_extraction.py`
+**Function:** `match_image_to_caption()` — `utils/caption_extractor.py`
 
-For every solar image in `extraction_log.json` (iterated in global index order, same as `label_plots.py`):
+For every solar image in `extraction_log.json` (iterated in index order):
 
-1. Look up the image's bounding rectangle using its global index into the flattened bbox list.
+1. Build a `fitz.Rect` from the image's logged `bbox` (`fitz.Rect(*entry["bbox"])`). Images without a recorded bbox are left without a caption.
 2. Call `match_image_to_caption(page, img_rect, captions_by_page)` to find the nearest caption by vertical gap. The search strategy is:
    - **Same page first** — pick the caption with the smallest vertical distance from the image edges.
    - **Adjacent pages** — if no caption is on the same page, check the next page then the previous.
@@ -187,13 +194,8 @@ The result for each image is:
 - `figure_label` — e.g. `"Figure 2"`
 - `paragraphs` — list of body paragraph strings that cite this figure
 
-### Step 6: NLP classification (fallback)
-**Function:** `classify_structure(caption_text)` — `utils/structure_classifier_nlp.py`
-
-Runs zero-shot classification (facebook/bart-large-mnli) on the caption text to produce a `phenomenon` label and a numeric `confidence` score. These values are only used as fallbacks: if the LLM returns a `phenomenon` or `confidence` field, those take precedence; the NLP result fills in the gap only when the LLM leaves those fields absent or null.
-
-### Step 7: Build prompt and query LLM
-**Functions:** `_query_model()`, `SYSTEM_PROMPT`, `USER_TEMPLATE` — `scripts/stage1_metadata_extraction.py`
+### Step 6: Build prompt and query LLM
+**Functions:** `_query_model()`, `SYSTEM_PROMPT`, `USER_TEMPLATE` — `scripts/metadata_extraction.py`
 
 For each solar image (skipped if both caption and paragraphs are empty), the LLM is called with a focused two-message prompt:
 
@@ -219,20 +221,20 @@ This is a per-image call, not a whole-paper call — the LLM sees only the conte
 
 Generation uses `max_new_tokens=512` (sufficient for one JSON object), `temperature=0.1` (near-deterministic for JSON stability), and `do_sample=True`.
 
-### Step 8: Parse LLM output
-**Function:** `_parse_llm_output(raw)` — `scripts/stage1_metadata_extraction.py`
+### Step 7: Parse LLM output
+**Function:** `_parse_llm_output(raw)` — `scripts/metadata_extraction.py`
 
 See [JSON Parsing and Fallback Strategy](#json-parsing-and-fallback-strategy).
 
-If parsing fails (returns `{}`), all LLM-derived fields for that image are `null`, but the NLP fallback still fills `phenomenon` and `confidence`. The image is never dropped.
+If parsing fails (returns `{}`), all LLM-derived fields for that image are `null` and `confidence` defaults to `"low"`. The image is never dropped.
 
-### Step 9: Assemble and write the result JSON
-**Function:** `_write_result()` — `scripts/stage1_metadata_extraction.py`
+### Step 8: Assemble and write the result JSON
+**Function:** `_write_result()` — `scripts/metadata_extraction.py`
 
 After all solar images are processed, writes one JSON file with the structure described in [Output Format](#output-format). The `status` field is `"success"` if at least one observation was produced, `"failed"` otherwise.
 
-### Step 10: Print progress and summary
-**Implemented in:** `main()` — `scripts/stage1_metadata_extraction.py`
+### Step 9: Print progress and summary
+**Implemented in:** `main()` — `scripts/metadata_extraction.py`
 
 After each paper:
 ```
@@ -250,7 +252,7 @@ Summary: 8 processed, 3 skipped, 1 failed  (total: 12)
 
 ## Model Loading and Quantization
 
-**Function:** `load_model(model_name)` — `scripts/stage1_metadata_extraction.py`
+**Function:** `load_model(model_name)` — `scripts/metadata_extraction.py`
 
 The model is loaded once before the paper loop and kept in GPU memory for the entire batch. Loading takes approximately 1–2 minutes after the weights are cached locally.
 
@@ -277,7 +279,7 @@ model = AutoModelForCausalLM.from_pretrained(
 
 ## HuggingFace Model Cache
 
-Both `stage1_metadata_extraction.py` (Qwen2.5-14B-Instruct) and `utils/structure_classifier_nlp.py` (facebook/bart-large-mnli) redirect the HuggingFace cache to the project-local `models/` directory:
+`metadata_extraction.py` redirects the HuggingFace cache to the project-local `models/` directory:
 
 ```python
 os.environ.setdefault(
@@ -292,19 +294,16 @@ This line is placed at module level **before** any `from transformers import ...
 ```
 models/
 └── hub/
-    ├── models--Qwen--Qwen2.5-14B-Instruct/
-    │   ├── blobs/           ← actual weight files (~14 GB)
-    │   └── snapshots/
-    └── models--facebook--bart-large-mnli/
-        ├── blobs/
+    └── models--Qwen--Qwen2.5-14B-Instruct/
+        ├── blobs/           ← actual weight files (~14 GB)
         └── snapshots/
 ```
 
-**Disk space:** Qwen2.5-14B-Instruct requires ~14 GB; facebook/bart-large-mnli requires ~1.6 GB. Total ~16 GB on `scratchsan`.
+**Disk space:** Qwen2.5-14B-Instruct requires ~14 GB on `scratchsan`.
 
 **Offline mode:**
 ```bash
-HF_HUB_OFFLINE=1 ./tools/extract_plots.sh metadata --paper_dir ...
+HF_HUB_OFFLINE=1 ./tools/extract_plots.sh metadata --paper-name "2012-01 - Labrosse, N"
 ```
 
 ---
@@ -333,7 +332,7 @@ A typical per-image prompt (figure label + caption + a few body paragraphs) is 2
 
 ## JSON Parsing and Fallback Strategy
 
-**Function:** `_parse_llm_output(raw)` — `scripts/stage1_metadata_extraction.py`
+**Function:** `_parse_llm_output(raw)` — `scripts/metadata_extraction.py`
 
 The parser expects a single JSON object (not an array). It handles common model deviations in two tiers:
 
@@ -357,7 +356,7 @@ result = json.loads(match.group())
 
 **Tier 3: Graceful empty return**
 
-If both tiers fail, `_parse_llm_output` returns `{}` (an empty dict). The caller fills all LLM-derived fields with `null` and the NLP fallback (`classify_structure`) covers `phenomenon` and `confidence`. The image record is always written — it is never silently dropped.
+If both tiers fail, `_parse_llm_output` returns `{}` (an empty dict). The caller fills all LLM-derived fields with `null` and `confidence` defaults to `"low"`. The image record is always written — it is never silently dropped.
 
 ---
 
@@ -365,16 +364,16 @@ If both tiers fail, `_parse_llm_output` returns `{}` (an empty dict). The caller
 
 ### Per-paper JSON file
 
-One file per paper, saved as `<output_dir>/<folder_name>.json`:
+One file per paper, saved as `<root>/metadata/<name>.json`:
 
 ```json
 {
-  "paper": "paper_2620529.pdf",
+  "paper": "2012-01 - Labrosse, N.pdf",
   "paper_authors": "Labrosse, N.",
   "paper_title": "Plasma diagnostic in eruptive prominences from SDO/AIA observations at 304 Å",
   "observations": [
     {
-      "observation_filename": "solar_001_p3_aia_false_color",
+      "observation_filename": "solar_001_p3_aia_false_color.png",
       "figure": 2,
       "caption": "Fig. 2. Top: Evolution of the 2010-06-13 prominence eruption at 304 Å ...",
       "paragraphs": [
@@ -393,7 +392,7 @@ One file per paper, saved as `<output_dir>/<folder_name>.json`:
       "confidence": "high"
     },
     {
-      "observation_filename": "solar_002_p3_aia_false_color",
+      "observation_filename": "solar_002_p3_aia_false_color.png",
       "figure": 2,
       "caption": "Fig. 2. Top: Evolution of the 2010-06-13 prominence eruption at 304 Å ...",
       "paragraphs": [
@@ -421,7 +420,7 @@ One file per paper, saved as `<output_dir>/<folder_name>.json`:
 
 | Field | Description |
 |-------|-------------|
-| `paper` | PDF filename (e.g. `paper_2620529.pdf`) |
+| `paper` | PDF filename (e.g. `2012-01 - Labrosse, N.pdf`) |
 | `paper_authors` | Author string from PDF metadata or `first_author` from the extraction log |
 | `paper_title` | Paper title from the extraction log |
 | `observations` | Array of per-image observation objects (one entry per solar image) |
@@ -431,7 +430,7 @@ One file per paper, saved as `<output_dir>/<folder_name>.json`:
 
 | Field | Type | Source | Description |
 |-------|------|--------|-------------|
-| `observation_filename` | string | extraction log | Stem of the image file, e.g. `solar_001_p3_aia_false_color` |
+| `observation_filename` | string | extraction log | Saved image filename, e.g. `solar_001_p3_aia_false_color.png` |
 | `figure` | integer or `null` | caption label | Leading figure number extracted from the matched caption label |
 | `caption` | string | PDF caption | Full text of the matched figure caption (for user verification) |
 | `paragraphs` | list of strings | PDF body text | Body paragraphs that explicitly cite this figure (for user verification) |
@@ -443,8 +442,8 @@ One file per paper, saved as `<output_dir>/<folder_name>.json`:
 | `fov_arcsec` | `[width, height]` or `null` | LLM | Field of view in arcseconds |
 | `center_tx_arcsec` | float or `null` | LLM | Heliprojective Tx of the observation center |
 | `center_ty_arcsec` | float or `null` | LLM | Heliprojective Ty of the observation center |
-| `phenomenon` | string | LLM, then NLP | Solar structure/event label; NLP (`classify_structure`) used as fallback |
-| `confidence` | `"high"` / `"medium"` / `"low"` | LLM, then NLP | Drives SDO query strategy in Stage 2 |
+| `phenomenon` | string or `null` | LLM | Solar structure/event label |
+| `confidence` | `"high"` / `"medium"` / `"low"` | LLM (defaults to `"low"`) | Drives the SDO query strategy in the `query` stage |
 
 The `caption` and `paragraphs` fields are included so the user can inspect the source text that informed each observation's metadata and verify that the LLM extracted from the correct context.
 
@@ -456,12 +455,10 @@ The `caption` and `paragraphs` fields are included so the user can inspect the s
 # 1. Activate the conda environment
 conda activate pytorch_jupyter
 
-# 2. Run metadata extraction on the Labrosse paper folder
-./tools/extract_plots.sh metadata \
-    --paper_dir "output/papers/2012-01 - Labrosse, N" \
-    --output_dir output/metadata/
+# 2. Run metadata extraction on the Labrosse paper
+./tools/extract_plots.sh metadata --paper-name "2012-01 - Labrosse, N"
 # Output:
-#   Found 1 paper director(ies) to process
+#   Found 1 paper(s) to process
 #   Loading tokenizer: Qwen/Qwen2.5-14B-Instruct
 #   Loading model with 8-bit quantization …
 #   Model loaded.
@@ -473,30 +470,23 @@ conda activate pytorch_jupyter
 cat "output/metadata/2012-01 - Labrosse, N.json"
 
 # 4. Process all papers at once
-./tools/extract_plots.sh metadata \
-    --pdf_dir output/papers/ \
-    --output_dir output/metadata/
+./tools/extract_plots.sh metadata --all
 
-# 5. Hand off the metadata to Stage 2
-./tools/extract_plots.sh query \
-    --metadata_dir output/metadata/ \
-    --fits_dir output/fits/ \
-    --output_dir output/matched/
+# 5. Hand off the metadata to the query stage
+./tools/extract_plots.sh query --all
 
 # 6. Retry a paper by deleting its JSON and re-running
 rm "output/metadata/2012-01 - Labrosse, N.json"
-./tools/extract_plots.sh metadata \
-    --paper_dir "output/papers/2012-01 - Labrosse, N" \
-    --output_dir output/metadata/
+./tools/extract_plots.sh metadata --paper-name "2012-01 - Labrosse, N"
 ```
 
 ---
 
 ## Known Limitations
 
-1. **Scanned PDFs produce no text:** PyMuPDF can only extract text from PDFs with an embedded text layer. Papers distributed as scanned images (rare in modern astrophysics journals) will produce empty captions and paragraphs. Those images will still be written to the output JSON, but all LLM-derived fields will be `null` and `phenomenon`/`confidence` will come from the NLP model alone.
+1. **Scanned PDFs produce no text:** PyMuPDF can only extract text from PDFs with an embedded text layer. Papers distributed as scanned images (rare in modern astrophysics journals) will produce empty captions and paragraphs. Those images are skipped by the LLM (no context), so they contribute no observation.
 
-2. **One LLM call per image:** The pipeline calls the LLM once for every solar image. Papers with many solar images (e.g. 20+) take proportionally longer. Unlike the previous whole-paper approach, there is no shared context across images — each call is independent.
+2. **One LLM call per image:** The pipeline calls the LLM once for every solar image. Papers with many solar images (e.g. 20+) take proportionally longer. Each call is independent — there is no shared context across images.
 
 3. **Multiple images per figure get the same context:** If several solar images belong to the same figure (e.g. sub-panels a, b, c), they all receive the same caption and body paragraphs. The LLM cannot distinguish which sub-panel it is looking at and may return identical or ambiguous metadata for those images. Sub-panel identification would require passing the actual image content to a vision model.
 
@@ -509,3 +499,4 @@ rm "output/metadata/2012-01 - Labrosse, N.json"
 7. **JSON instability:** Even at `temperature=0.1`, the model occasionally produces malformed JSON. When both parsing tiers fail, all LLM fields are `null` for that image. Inspect the `caption` and `paragraphs` fields in the output to understand what context was available.
 
 8. **First-run model download:** The ~14 GB Qwen2.5-14B-Instruct weights are downloaded from HuggingFace Hub on first run and cached in `models/hub/`. Ensure `scratchsan` has at least 16 GB free before the first run.
+```

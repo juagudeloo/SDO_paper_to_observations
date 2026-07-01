@@ -1,6 +1,6 @@
 # SDO_QUERY — Pipeline Documentation
 
-Step-by-step explanation of the automated SDO archive querying and submap extraction pipeline (Stage 2: `query`).
+Step-by-step explanation of the automated SDO archive querying and submap extraction stage (`query`).
 
 ---
 
@@ -9,7 +9,7 @@ Step-by-step explanation of the automated SDO archive querying and submap extrac
 1. [Overview](#overview)
 2. [Prerequisites](#prerequisites)
 3. [Pipeline Structure](#pipeline-structure)
-4. [Stage 2: Query SDO (`query`)](#stage-2-query-sdo)
+4. [The Query Stage (`query`)](#the-query-stage)
 5. [FITS Download and Caching](#fits-download-and-caching)
 6. [Extraction Strategies](#extraction-strategies)
 7. [Output Format](#output-format)
@@ -20,24 +20,24 @@ Step-by-step explanation of the automated SDO archive querying and submap extrac
 
 ## Overview
 
-The `query` stage reads the JSON metadata files produced by Stage 1 (`metadata`) and, for each observation event, downloads the closest matching FITS file from the Virtual Solar Observatory (VSO), crops the solar map to the relevant region using one of three strategies, and saves a normalised PNG alongside a companion JSON file.
+The `query` stage reads the JSON metadata files produced by the `metadata` stage and, for each observation event, downloads the closest matching FITS file from the Virtual Solar Observatory (VSO), crops the solar map to the relevant region using one of three strategies, and saves a normalised PNG alongside a companion JSON file. It addresses papers by canonical name (`--paper-name`) or processes them all (`--all`), reading `<root>/metadata/` and writing `<root>/matched/` (FITS cached in `<root>/fits/`).
 
 ```
-papers/metadata/
-    ├── paper_A.json          (produced by metadata stage)
-    └── paper_B.json
+output/metadata/
+    ├── 2012-01 - Labrosse, N.json   (produced by metadata stage)
+    └── 2012-01 - Song, Y.json
               │
          (query stage)
               │
     ┌─────────┴─────────┐
     ▼                   ▼
-papers/sdo_fits/        papers/matched/
-    └── paper_A__000    └── paper_A__000.png   ← normalised uint8 PNG
-        __AIA__171        paper_A__000.json   ← companion metadata JSON
+output/fits/            output/matched/
+    └── ...__000        └── ...__000.png   ← normalised uint8 PNG
+        __AIA__304          ...__000.json  ← companion metadata JSON
         __2010-...fits
 ```
 
-Three cropping strategies are applied in priority order based on the `confidence` field extracted in Stage 1:
+Three cropping strategies are applied in priority order based on the `confidence` field extracted by the `metadata` stage:
 
 | Strategy | Condition | Source data used |
 |----------|-----------|-----------------|
@@ -73,9 +73,9 @@ pip install opencv-python numpy
 
 The Virtual Solar Observatory (`vso.nascom.nasa.gov`) must be reachable for `Fido.search` and `Fido.fetch` calls. The stage gracefully handles connection errors and marks events as failed rather than crashing.
 
-### 4. Stage 1 output
+### 4. Metadata-stage output
 
-The `--metadata_dir` must contain at least one JSON file with `"status": "success"` produced by `stage1_metadata_extraction.py`. Files with `"status": "failed"` are silently skipped.
+`<root>/metadata/` must contain at least one JSON file with `"status": "success"` produced by `metadata_extraction.py`. Files with `"status": "failed"` are silently skipped.
 
 ### 5. Python environment (pytorch_jupyter conda env)
 
@@ -90,58 +90,63 @@ tools/
 └── extract_plots.sh      # Shell entry point (validates env, dispatches)
 
 scripts/                  # Main entry points (run directly)
-└── stage2_sdo_query.py   # Stage 2 orchestrator (all logic self-contained)
+└── sdo_query.py          # Query stage orchestrator (all query logic self-contained)
 
-utils/                    # No new utilities — stage2 imports only stdlib + sunpy/cv2
+utils/
+└── folder_naming.py      # canonical paths: metadata_dir(), matched_dir(), fits_dir(), ...
 ```
 
-Unlike the earlier stages, `stage2_sdo_query.py` does not import from `utils/`. All coordinate manipulation, FITS handling, and image normalisation logic is contained in the script itself. This keeps the sunpy/astropy dependency isolated from the classical OpenCV pipeline in `utils/`.
+`sdo_query.py` imports only `utils/folder_naming.py` (to resolve the canonical layout); all coordinate manipulation, FITS handling, and image normalisation logic is contained in the script itself. This keeps the sunpy/astropy dependency isolated from the classical OpenCV pipeline in `utils/`.
 
 ---
 
-## Stage 2: Query SDO
+## The Query Stage
 
-**Command:**
+**Command (single paper):**
 ```bash
-./tools/extract_plots.sh query \
-    --metadata_dir papers/metadata/ \
-    --fits_dir papers/sdo_fits/ \
-    --output_dir papers/matched/
+./tools/extract_plots.sh query --paper-name "2012-01 - Labrosse, N"
 ```
 
-**Implemented in:** `scripts/stage2_sdo_query.py`.
+**Command (all papers):**
+```bash
+./tools/extract_plots.sh query --all
+```
+
+Both accept `--output-dir DIR` (the canonical output root, default `output`) and `--fits-dir DIR` (FITS cache, default `<root>/fits`).
+
+**Implemented in:** `scripts/sdo_query.py`.
 
 **What it does, step by step:**
 
 ### Step 1: Load all observation events
-**Function:** `load_all_events(metadata_dir)` — `scripts/stage2_sdo_query.py`
+**Function:** `load_events(json_paths)` — `scripts/sdo_query.py`
 
-Iterates every `*.json` file in `metadata_dir` in sorted filename order. Reads each file and skips it if `"status"` is not `"success"`. For files that pass, unpacks the `"observations"` list and appends one `(paper_stem, event_index, obs_dict)` tuple per event to the global event list.
+`main()` first resolves which metadata files to read: with `--paper-name`, just `<root>/metadata/<name>.json`; with `--all`, every `<root>/metadata/*.json`. `load_events` then reads each in sorted order and skips any whose `"status"` is not `"success"`. For files that pass, it unpacks the `"observations"` list and appends one `(paper_stem, event_index, obs_dict)` tuple per event to the global event list.
 
 `paper_stem` is the filename without extension (e.g., `"2012-01 - Labrosse, N"`). `event_index` is the zero-based position of the observation within that paper's list. These two values together uniquely identify an event and are used to build deterministic output filenames.
 
 ### Step 2: Check for existing output (resumability)
-**Implemented in:** `process_event()` — `scripts/stage2_sdo_query.py`
+**Implemented in:** `process_event()` — `scripts/sdo_query.py`
 
 Derives the output PNG path as `<output_dir>/<safe_stem>__<event_idx:03d>.png` (with characters unsafe for filenames replaced by underscores). If the PNG already exists, returns `"skipped"` immediately without any network call or disk I/O. The companion JSON is assumed to be present alongside the PNG.
 
 ### Step 3: Download the FITS file
-**Function:** `fetch_fits(obs, fits_dir, cache_path)` — `scripts/stage2_sdo_query.py`
+**Function:** `fetch_fits(obs, fits_dir, cache_path)` — `scripts/sdo_query.py`
 
 See [FITS Download and Caching](#fits-download-and-caching) for the full algorithm.
 
 ### Step 4: Load the FITS as a sunpy Map
-**Function:** `load_map(fits_path)` — `scripts/stage2_sdo_query.py`
+**Function:** `load_map(fits_path)` — `scripts/sdo_query.py`
 
 Wraps `sunpy.map.Map(fits_path)` inside `warnings.catch_warnings` with `warnings.simplefilter("ignore")`. This suppresses `astropy.io.fits.verify.VerifyWarning` (triggered by non-standard FITS headers, common in SDO/HMI files) without cluttering the console output. Returns `None` on any exception, which `process_event()` treats as a failure.
 
 ### Step 5: Select and apply an extraction strategy
-**Functions:** `apply_strategy_a()`, `apply_strategy_b()` — `scripts/stage2_sdo_query.py`
+**Functions:** `apply_strategy_a()`, `apply_strategy_b()` — `scripts/sdo_query.py`
 
 See [Extraction Strategies](#extraction-strategies) for the full algorithm.
 
 ### Step 6: Normalise and save the PNG
-**Functions:** `normalize_to_uint8(data)`, `save_outputs(smap, output_png, companion)` — `scripts/stage2_sdo_query.py`
+**Functions:** `normalize_to_uint8(data)`, `save_outputs(smap, output_png, companion)` — `scripts/sdo_query.py`
 
 `normalize_to_uint8` applies:
 ```python
@@ -153,7 +158,7 @@ cv2.normalize(np.abs(data), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 `save_outputs` calls `cv2.imwrite` to write the PNG, then writes the companion JSON to the same directory with the same stem and a `.json` extension.
 
 ### Step 7: Print progress and strategy breakdown
-**Implemented in:** `main()` — `scripts/stage2_sdo_query.py`
+**Implemented in:** `main()` — `scripts/sdo_query.py`
 
 After each event, prints one line:
 ```
@@ -177,7 +182,7 @@ Summary (12 events):
 
 ## FITS Download and Caching
 
-**Function:** `fetch_fits(obs, fits_dir, cache_path)` — `scripts/stage2_sdo_query.py`
+**Function:** `fetch_fits(obs, fits_dir, cache_path)` — `scripts/sdo_query.py`
 
 All `sunpy` and `astropy` calls in this function are wrapped in a single `try/except Exception` block. If any step raises an error (network timeout, empty VSO response, download failure), the function logs a warning and returns `None`. The calling function records the event as `"failed"`.
 
@@ -232,7 +237,7 @@ downloaded = Fido.fetch(results[0, 0], path=fits_dir)
 ## Extraction Strategies
 
 ### Strategy A — Explicit coordinates
-**Function:** `apply_strategy_a(smap, obs)` — `scripts/stage2_sdo_query.py`
+**Function:** `apply_strategy_a(smap, obs)` — `scripts/sdo_query.py`
 
 Applied when `confidence="high"` and `center_tx_arcsec` is not null.
 
@@ -254,7 +259,7 @@ return smap.submap(bl, top_right=tr)
 If `smap.submap()` raises an exception (e.g., the requested coordinates fall outside the map extent), the function returns the full map and logs a warning. The companion JSON records `strategy: "strategy_a"` regardless, so downstream tools can identify which events had fallback behaviour.
 
 ### Strategy B — Limb position
-**Function:** `apply_strategy_b(smap, limb)` — `scripts/stage2_sdo_query.py`
+**Function:** `apply_strategy_b(smap, limb)` — `scripts/sdo_query.py`
 
 Applied when `confidence="medium"` and `limb_position` is not null.
 
@@ -289,7 +294,7 @@ No submap operation is performed. The full-disk normalised map is saved directly
 - Events with `limb_position="disk"` (the paper explicitly describes a full-disk context image)
 - Fallback from Strategy B when `limb_position` is unknown
 
-Full-disk images are larger on disk (~4096×4096 pixels for AIA, ~4096×4096 for HMI) but are the most valuable inputs for the downstream Stage 3 feature-matching pipeline, since the full disk provides the most context for RANSAC alignment.
+Full-disk images are larger on disk (~4096×4096 pixels for AIA, ~4096×4096 for HMI) but are the most valuable inputs for downstream feature-matching, since the full disk provides the most context for RANSAC alignment.
 
 ---
 
@@ -304,7 +309,7 @@ A normalised uint8 grayscale PNG saved as:
 
 For example:
 ```
-papers/matched/2012-01___Labrosse__N__000.png
+output/matched/2012-01___Labrosse__N__000.png
 ```
 
 The image contains the cropped or full-disk solar region, normalised so the minimum pixel value maps to 0 and the maximum to 255.
@@ -343,7 +348,7 @@ A JSON file with the same stem as the PNG, saved alongside it:
 
 ### FITS cache
 
-Downloaded FITS files are retained in `--fits_dir`. They are never deleted by the pipeline. Re-running the `query` command reuses cached FITS files without re-downloading, even if the output PNG is deleted and needs to be regenerated.
+Downloaded FITS files are retained in the FITS cache (`--fits-dir`, default `<root>/fits/`). They are never deleted by the pipeline. Re-running the `query` command reuses cached FITS files without re-downloading, even if the output PNG is deleted and needs to be regenerated.
 
 ---
 
@@ -353,18 +358,13 @@ Downloaded FITS files are retained in `--fits_dir`. They are never deleted by th
 # 1. Activate the conda environment
 conda activate pytorch_jupyter
 
-# 2. Run Stage 1 first to produce metadata (or use existing metadata files)
-./tools/extract_plots.sh metadata \
-    --pdf_dir papers/raw_pdfs/ \
-    --output_dir papers/metadata/
+# 2. Run the metadata stage first (or use existing metadata files)
+./tools/extract_plots.sh metadata --all
 
-# 3. Run Stage 2
-./tools/extract_plots.sh query \
-    --metadata_dir papers/metadata/ \
-    --fits_dir papers/sdo_fits/ \
-    --output_dir papers/matched/
+# 3. Run the query stage
+./tools/extract_plots.sh query --all
 # Output:
-#   Loaded 6 observation event(s) from papers/metadata/
+#   Loaded 6 observation event(s) from output/metadata
 #   [strategy_a   ]  2012-01 - Labrosse, N [000]  2010-09-19T08:00:00  AIA 304Å
 #   [strategy_a   ]  2012-01 - Labrosse, N [001]  2010-09-19T08:00:00  AIA 171Å
 #   [strategy_b   ]  2012-01 - Song, Y [000]       2012-07-04T09:54:53  HMI noneÅ
@@ -380,21 +380,18 @@ conda activate pytorch_jupyter
 #     Failed                        : 1
 
 # 4. Inspect the outputs
-ls papers/matched/
+ls output/matched/
 # 2012-01___Labrosse__N__000.png
 # 2012-01___Labrosse__N__000.json
 # 2012-01___Labrosse__N__001.png
 # ...
 
-cat papers/matched/2012-01___Labrosse__N__000.json
+cat output/matched/2012-01___Labrosse__N__000.json
 
 # 5. Re-run is safe — skips all events whose PNGs already exist
-./tools/extract_plots.sh query \
-    --metadata_dir papers/metadata/ \
-    --fits_dir papers/sdo_fits/ \
-    --output_dir papers/matched/
+./tools/extract_plots.sh query --all
 # Output:
-#   Loaded 6 observation event(s) from papers/metadata/
+#   Loaded 6 observation event(s) from output/metadata
 #   [skipped      ]  2012-01 - Labrosse, N [000]  ...
 #   [skipped      ]  2012-01 - Labrosse, N [001]  ...
 #   ...

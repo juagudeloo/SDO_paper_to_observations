@@ -30,11 +30,17 @@ The pipeline has two stages:
                                          |
                               (pick paper ID)
                                          |
-[NASA ADS SDO API] ──extract──> output/YYYY-MM - Author, I/
+[NASA ADS SDO API] ──extract──> output/images/YYYY-MM - Author, I/
                                     ├── solar_001_p2_aia_false_color.png
                                     ├── solar_002_p3_hmi_grayscale.png
                                     └── extraction_log.json
+                               output/papers/YYYY-MM - Author, I.pdf
 ```
+
+`extract` writes directly into the canonical `output/` layout (`images/`,
+`papers/`) that the later stages — `metadata` and `query` — consume, each
+addressing a paper by its canonical name. See `docs/METADATA_EXTRACTION.md` and
+`docs/SDO_QUERY.md` for those stages.
 
 ---
 
@@ -180,7 +186,7 @@ Sends `GET /documents/{id}/download-pdf` with optional `?source=arxiv` or `?sour
 
 `format_publication_date` converts the DB format `YYYY-MM-00` (day always `00`) to a human-readable string: `2012-07-00` → `2012-07`, `2010-00-00` → `2010`.
 
-`build_folder_name` combines the formatted date and author into `YYYY-MM - LastName, F`, then strips any characters forbidden by common filesystems (`/ \ : * ? " < > |`). The resulting folder is created inside `--output-dir` (default `./output/`).
+`build_folder_name` combines the formatted date and author into `YYYY-MM - LastName, F` (the canonical **paper name**), then strips any characters forbidden by common filesystems (`/ \ : * ? " < > |`). The per-paper image directory is resolved via `folder_naming.images_dir(root, name)` → `<root>/images/<name>/`, where `root` is `--output-dir` (default `./output/`). All canonical paths (`images_dir`, `pdf_path`, `log_path`, …) live in `utils/folder_naming.py` so no stage hardcodes `output/...`.
 
 ### Step 5: Extract images
 **Function:** `extract_pdf_images(pdf_path, output_dir)` — `utils/pdf_extractor.py`
@@ -189,7 +195,7 @@ Uses **PyMuPDF** (`fitz`) to iterate every page and collect embedded images via 
 
 Each unique image (tracked by its internal `xref` reference number to avoid duplicates from shared objects) is decoded and saved as a PNG via the helper `_save_as_png()` — which converts JPEG, JPEG2000, and CMYK images to standard RGB PNG on the fly using **Pillow**.
 
-The function returns a list of `ImageMetadata` dataclass objects, one per image, carrying: sequential index, page number, width × height, color space (`rgb`/`gray`/`cmyk`), original encoding, and the PNG file path.
+The function returns a list of `ImageMetadata` dataclass objects, one per image, carrying: sequential index, page number, width × height, color space (`rgb`/`gray`/`cmyk`), original encoding, the PNG file path, and the image's **page-placement `bbox`** `(x0, y0, x1, y1)`. The bbox comes from `page.get_image_rects(xref)` (largest-area rect when an image is placed more than once) and is what lets the downstream `metadata` stage match each image to its figure caption without re-parsing the PDF.
 
 ### Step 6: Classify images
 **Function:** `classify_image(img_meta)` — `utils/solar_classifier.py`
@@ -208,16 +214,22 @@ The classification result (a `ClassificationResult` dataclass) contains:
 ### Step 7: Save solar images
 **Implemented in:** `main()` — `scripts/extract_plots.py`
 
-Iterates the list of `(ImageMetadata, ClassificationResult)` pairs for images that passed the filter (`is_solar=True` and `score >= --min-score`, default 0.25). Each is copied from the temp directory to the output folder using `shutil.copy()` with a descriptive filename that encodes its sequential number, PDF page, and detected type:
+Iterates the list of `(ImageMetadata, ClassificationResult)` triples for images that passed the filter (`is_solar=True` and `score >= --min-score`, default 0.25). Each is copied from the temp directory into `output/images/<name>/` using `shutil.copy()` with a descriptive filename that encodes its sequential number, PDF page, and detected type:
 ```
 solar_001_p2_aia_false_color.png
 solar_002_p3_hmi_grayscale.png
 ```
+The saved filename is written back into that image's log entry (`filename`) so the `metadata` stage can link each observation to a real file on disk.
 
 ### Step 8: Write extraction log
 **Implemented in:** `main()` — `scripts/extract_plots.py`
 
-Writes `extraction_log.json` to the output folder using Python's built-in `json.dump`. The log contains the paper metadata at the top, plus one entry per image (both kept and rejected) with its size, color space, classification score, signals list, and image type. This log is the audit trail that lets you review why an image was kept or discarded without re-running the pipeline.
+Writes `extraction_log.json` into `output/images/<name>/` using Python's built-in `json.dump`. The log contains the paper metadata at the top, plus one entry per image (both kept and rejected) with its page, **bbox**, size, color space, classification score, signals list, image type, and — for saved images — the `filename`. This log is both the audit trail (why an image was kept or discarded) *and* the input contract for the `metadata` stage (which images are solar, where they sit on the page, and what file they map to) — so `metadata` never re-derives any of it from the PDF.
+
+### Step 9: Keep the PDF
+**Implemented in:** `main()` — `scripts/extract_plots.py`
+
+The downloaded PDF is copied to its canonical location `output/papers/<name>.pdf` (`folder_naming.pdf_path`). This happens **by default** because the `metadata` stage needs the PDF for caption text and citing paragraphs; pass `--no-keep-pdf` to skip it.
 
 ---
 
@@ -361,13 +373,22 @@ The raw integer score is compared against the threshold (5). The normalized conf
 
 ## Output Folder Naming
 
-The output folder for each paper follows this format:
+Each paper is identified by a canonical **name**:
 
 ```
 YYYY-MM - LastName, F
 ```
 
-For example: `2012-01 - Labrosse, N`
+For example: `2012-01 - Labrosse, N`. That name keys the whole canonical layout under the output root (default `output/`):
+
+```
+output/
+  papers/    <name>.pdf                         # kept PDF
+  images/    <name>/*.png + extraction_log.json # this stage
+  metadata/  <name>.json                        # metadata stage
+  matched/   ...                                # query stage
+  fits/      ...                                # query FITS cache
+```
 
 **Date handling:** The database stores publication dates as `YYYY-MM-00` (day is always `00`). The formatter strips the `00` day to produce `YYYY-MM`. For year-only entries (`YYYY-00-00`), it produces just `YYYY`.
 
@@ -386,27 +407,26 @@ cd ../NASA_ADS_SDO && ./run_api.sh
 # Output: papers_20120101_20131231.csv
 # Open the CSV, browse titles, pick a paper ID (e.g. 2620529)
 
-# 3. Extract solar images from that paper
+# 3. Extract solar images from that paper (PDF kept in output/papers/ by default)
 ./tools/extract_plots.sh extract --id 2620529
 # Output:
 #   Processing paper ID 2620529
-#     Title     : White-light flares: a TRACE, RHESSI and SOHO/MDI multi-wavelength stu...
-#     Published : 2012-07-00
-#     Bibcode   : 2012A&A...543A..53S
-#     PDF size  : 1.40 MB
-#     Author    : Song, Y
-#     Output    : output/2012-01 - Labrosse, N
-#   Found 5 embedded images in PDF
-#     [skip ] img-000 p1 240x180 index score=0.00 [too_small]
-#     [skip ] img-001 p1 240x180 index score=0.00 [palette_indexed]
-#     [SOLAR] img-002 p3 1024x768 rgb  score=0.65 [aia_false_color_22%, dark_background, full_disk_circle_r320]
+#     Title     : Plasma diagnostic in eruptive prominences from SDO/AIA observations...
+#     Published : 2012-01-00
+#     Bibcode   : 2012A&A...537A.100L
+#     PDF size  : 0.90 MB
+#     Author    : Labrosse, N
+#     Output    : output/images/2012-01 - Labrosse, N
+#   Found 22 embedded images in PDF
+#     [SOLAR] img-000 p3 752x752 rgb  score=0.60 [dark_background, dark_region_17%, aia_false_color_102%]
 #     ...
-#   Extraction complete: 3/5 images classified as solar observations
-#   Output folder: output/2012-01 - Labrosse, N
-#   Log: output/2012-01 - Labrosse, N/extraction_log.json
+#   Extraction complete: 22/22 images classified as solar observations
+#   Output folder: output/images/2012-01 - Labrosse, N
+#   Log: output/images/2012-01 - Labrosse, N/extraction_log.json
+#   PDF kept at: output/papers/2012-01 - Labrosse, N.pdf
 
 # 4. View the extracted images
-ls output/2012-07\ -\ Song,\ Y/
+ls output/images/2012-01\ -\ Labrosse,\ N/
 ```
 
 ---

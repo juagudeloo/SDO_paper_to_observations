@@ -35,6 +35,15 @@ CAPTION_RE = re.compile(r"^(?:Figure|Fig\.)\s*\d+[a-z]?[.:\s]", re.IGNORECASE)
 # Used to extract only the label part, e.g. "Figure 1", "Fig. 2a"
 LABEL_RE = re.compile(r"((?:Figure|Fig\.)\s*\d+[a-z]?)", re.IGNORECASE)
 
+# Matches the start of a table caption: "Table 1", "Tab. 2."
+TABLE_CAPTION_RE = re.compile(r"^(?:Table|Tab\.)\s*\d+[.:\s]", re.IGNORECASE)
+
+# Extracts the table number from a caption, e.g. "Table 1" -> "1"
+TABLE_LABEL_RE = re.compile(r"(?:Table|Tab\.)\s*(\d+)", re.IGNORECASE)
+
+# Matches inline table citations in body text: "Table 1", "Tab. 2", "Tables 1 and 2"
+TABLE_BODY_REF_RE = re.compile(r"\b(?:Tables?|Tab\.)\s*(\d+)", re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -50,6 +59,21 @@ class Caption:
 
     def __post_init__(self):
         self.text = " ".join(self.text.split())
+
+
+@dataclass
+class Table:
+    """A table (caption + body text) extracted from a PDF page."""
+    label: str                                  # e.g. "Table 1"
+    number: str                                 # e.g. "1"
+    caption: str                                # caption line, whitespace-normalized
+    body_text: str                              # caption + header + rows + footnotes (raw text)
+    page: int                                   # 1-based page number
+    bbox: tuple[float, float, float, float]     # (x0, y0, x1, y1); union of merged blocks
+
+    def __post_init__(self):
+        self.caption = " ".join(self.caption.split())
+        self.body_text = " ".join(self.body_text.split())
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +303,181 @@ def extract_figure_body_refs(pdf_path: str) -> Dict[str, List[str]]:
     finally:
         doc.close()
     return refs
+
+
+# ---------------------------------------------------------------------------
+# Table extraction (caption + body) and figure -> table linking
+# ---------------------------------------------------------------------------
+#
+# find_tables() reconstructs poorly on vector-drawn tables (returns 0 on many
+# A&A PDFs), but get_text still streams the caption, header, rows and footnotes
+# as ordinary text blocks in reading order. We capture that raw text so the
+# metadata LLM can read values (dates, GOES class, NOAA AR, heliographic
+# locations like "S17W08") straight out of the table.
+
+# A block is treated as a caption/next-table/next-figure boundary, or as
+# running prose (starts with a lowercase word) — either ends the table body.
+_PROSE_START_RE = re.compile(r"^[a-z]")
+
+
+def extract_all_tables(pdf_path: str, max_body_chars: int = 4000) -> dict[str, "Table"]:
+    """
+    Extract tables (caption + body text) from a PDF, keyed by table number.
+
+    A table starts at a block matching ``TABLE_CAPTION_RE`` ("Table N", "Tab. N").
+    Its body is that caption block plus the following same-page text blocks
+    (header row, data rows, footnotes) merged in vertical order, stopping at the
+    next caption (table or figure), at a block that begins running prose, or when
+    ``max_body_chars`` is reached.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        max_body_chars: Soft cap on captured body text length per table.
+
+    Returns:
+        Dict mapping table-number string (e.g. "1") -> Table. When a number
+        appears more than once, the first occurrence wins.
+    """
+    if not _FITZ_AVAILABLE:
+        raise RuntimeError("PyMuPDF is required. Install with: pip install pymupdf")
+
+    tables: dict[str, Table] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_num in range(len(doc)):
+            page_number = page_num + 1
+            blocks = [
+                b for b in doc[page_num].get_text("dict").get("blocks", [])
+                if b.get("type") == 0 and _assemble_block_text(b)
+            ]
+            blocks.sort(key=lambda b: b["bbox"][1])  # top-to-bottom
+
+            i = 0
+            while i < len(blocks):
+                text = _assemble_block_text(blocks[i])
+                if not TABLE_CAPTION_RE.match(text):
+                    i += 1
+                    continue
+
+                num_match = TABLE_LABEL_RE.match(text)
+                number = num_match.group(1) if num_match else "?"
+                label = f"Table {number}"
+                caption_text = text
+                bbox = tuple(blocks[i]["bbox"])
+                body_parts = [text]
+
+                # Merge following blocks into the table body
+                j = i + 1
+                while j < len(blocks):
+                    nxt = _assemble_block_text(blocks[j])
+                    if (
+                        TABLE_CAPTION_RE.match(nxt)
+                        or CAPTION_RE.match(nxt)
+                        or _PROSE_START_RE.match(nxt)
+                        or sum(len(p) for p in body_parts) > max_body_chars
+                    ):
+                        break
+                    body_parts.append(nxt)
+                    bbox = _union_bbox(bbox, tuple(blocks[j]["bbox"]))
+                    j += 1
+
+                if number not in tables:
+                    tables[number] = Table(
+                        label=label,
+                        number=number,
+                        caption=caption_text,
+                        body_text=" ".join(body_parts),
+                        page=page_number,
+                        bbox=bbox,  # type: ignore[arg-type]
+                    )
+                i = j
+    finally:
+        doc.close()
+
+    logger.debug("Extracted %d table(s) from %s", len(tables), pdf_path)
+    return tables
+
+
+def _ordered_body_paragraphs(pdf_path: str) -> list[dict]:
+    """
+    Return non-caption body paragraphs in document order.
+
+    Each entry is ``{"page": int, "text": str, "figs": set[str], "tables": set[str]}``
+    where ``figs``/``tables`` are the figure/table numbers cited in that paragraph.
+    """
+    if not _FITZ_AVAILABLE:
+        raise RuntimeError("PyMuPDF is required. Install with: pip install pymupdf")
+
+    paragraphs: list[dict] = []
+    doc = fitz.open(pdf_path)
+    try:
+        for page_num in range(len(doc)):
+            for block in doc[page_num].get_text("dict").get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                text = _assemble_block_text(block)
+                if not text or CAPTION_RE.match(text) or TABLE_CAPTION_RE.match(text):
+                    continue
+                clean = " ".join(text.split())
+                figs = {m.group(1) for m in _FIG_BODY_REF_RE.finditer(clean)}
+                tabs = {m.group(1) for m in TABLE_BODY_REF_RE.finditer(clean)}
+                if not figs and not tabs:
+                    continue
+                paragraphs.append({
+                    "page": page_num + 1,
+                    "text": clean,
+                    "figs": figs,
+                    "tables": tabs,
+                })
+    finally:
+        doc.close()
+    return paragraphs
+
+
+def extract_figure_table_links(pdf_path: str, window: int = 4) -> dict[str, list[str]]:
+    """
+    Map each figure number to the table numbers it is linked to (hybrid strategy).
+
+    Primary (reference-driven): any table cited in a paragraph that also cites
+    the figure is linked to that figure.
+    Fallback (positional): for a figure with no co-cited table, scan a window of
+    ``+/- window`` paragraphs around each paragraph that cites the figure and
+    link any table found there.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        window: Number of neighbouring paragraphs to scan in the fallback.
+
+    Returns:
+        Dict mapping figure-number string -> sorted list of table-number strings.
+    """
+    paragraphs = _ordered_body_paragraphs(pdf_path)
+
+    # Figures that appear anywhere, and primary (co-citation) links
+    all_figs: set[str] = set()
+    links: dict[str, set[str]] = {}
+    for para in paragraphs:
+        for fig in para["figs"]:
+            all_figs.add(fig)
+            if para["tables"]:
+                links.setdefault(fig, set()).update(para["tables"])
+
+    # Fallback: positional window for figures with no primary link
+    for fig in all_figs:
+        if links.get(fig):
+            continue
+        found: set[str] = set()
+        for idx, para in enumerate(paragraphs):
+            if fig not in para["figs"]:
+                continue
+            lo = max(0, idx - window)
+            hi = min(len(paragraphs), idx + window + 1)
+            for neighbour in paragraphs[lo:hi]:
+                found.update(neighbour["tables"])
+        if found:
+            links[fig] = found
+
+    return {fig: sorted(nums) for fig, nums in links.items()}
 
 
 def build_figure_contexts(pdf_path: str) -> List[Dict]:

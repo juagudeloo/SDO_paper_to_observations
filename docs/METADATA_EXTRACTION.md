@@ -117,7 +117,8 @@ utils/
 ├── folder_naming.py              # canonical paths: log_path(), pdf_path(),
 │                                 # metadata_json(), iter_paper_names()
 └── caption_extractor.py          # extract_all_captions(), match_image_to_caption(),
-                                  # extract_figure_body_refs()
+                                  # extract_figure_body_refs(), extract_all_tables(),
+                                  # extract_figure_table_links()
 
 models/                           # HuggingFace model cache (HF_HOME)
 └── hub/
@@ -155,7 +156,9 @@ Both accept `--output-dir DIR` (the canonical output root, default `output`) and
 ### Step 2: Check for existing output (resumability)
 **Implemented in:** `process_paper()` — `scripts/metadata_extraction.py`
 
-The output path is `folder_naming.metadata_json(root, name)` → `<root>/metadata/<name>.json`. If that file already exists, `process_paper()` returns `"skipped"` immediately without loading the model or reading any files. This makes the stage safe to re-run after a crash or partial batch.
+The output path is `folder_naming.metadata_json(root, name)` → `<root>/metadata/<name>.json`. `main()` pre-filters the paper list against existing output **before** loading the model: any paper whose JSON already exists is printed as `[skip]` and the (~8 min) model load is skipped entirely if nothing is pending. This makes the stage safe to re-run after a crash or partial batch, and cheap to re-run when everything is already done.
+
+Pass `--verbose` / `-v` to raise logging to `DEBUG` and see step-by-step progress (caption/table extraction, per-image `[i/N] … querying LLM` lines) instead of a silent wait during model load and inference.
 
 ### Step 3: Load the extraction log and locate the PDF
 **Functions:** `_load_log()` — `scripts/metadata_extraction.py`; `folder_naming.pdf_path()`
@@ -166,21 +169,27 @@ The author string is resolved in order of priority:
 1. PDF document metadata (`fitz.open(pdf_path).metadata["author"]`)
 2. `first_author` field from `extraction_log.json`
 
-### Step 4: Extract captions and body references from the PDF
-**Functions:** `extract_all_captions()`, `extract_figure_body_refs()` — `utils/caption_extractor.py`
+### Step 4: Extract captions, body references, and tables from the PDF
+**Functions:** `extract_all_captions()`, `extract_figure_body_refs()`, `extract_all_tables()`, `extract_figure_table_links()` — `utils/caption_extractor.py`
 
-Two passes over the PDF are run once per paper (not once per image):
+Several passes over the PDF are run once per paper (not once per image):
 
 1. **`extract_all_captions(pdf_path)`** — scans every text block across all pages and identifies figure captions by the pattern `^(Figure|Fig\.)\s*\d+[a-z]?[.:\s]`. Returns a page-keyed dict of `Caption` objects (each with `figure_label`, full `text`, 1-based page number, and bounding box). Multi-block captions (captions split across consecutive text blocks) are merged automatically.
 
 2. **`extract_figure_body_refs(pdf_path)`** — scans all non-caption text blocks and finds paragraphs that contain an inline figure citation such as `"Fig. 2"`, `"Figure 2a"`, or `"Figs. 2 and 3"` (matched by `\b(?:Figs?\.?\s*|Figures?\s+)(\d+[a-zA-Z]?)`). Returns a dict mapping figure number string (e.g. `"2"`, `"2a"`) to a deduplicated list of paragraph texts in document order.
 
+3. **`extract_all_tables(pdf_path)`** — finds table captions (`^(Table|Tab\.)\s*\d+`) and captures each table's caption plus its body text (header, data rows, footnotes) by merging the following same-page blocks until the next caption, a running-prose block, or a character cap. `find_tables()` reconstructs poorly on vector-drawn A&A tables (often returns 0), but `get_text` still streams the grid as text in reading order, so values like NOAA AR number and per-event heliographic locations (`S17W08`) survive. Returns a dict mapping table number → `Table`.
+
+4. **`extract_figure_table_links(pdf_path)`** — maps each figure number to the table numbers it is linked to, using a **hybrid** strategy: primary is reference-driven (a table cited in a paragraph that also cites the figure is linked), with a positional fallback (for a figure with no co-cited table, scan a ±4-paragraph window around each figure mention). Returns a dict mapping figure number → list of table numbers.
+
 Image bounding boxes are **not** re-derived here — they come from the log (Step 5).
 
-### Step 5: Match each solar image to its caption and body paragraphs
+### Step 5: Match each saved image to its caption, body paragraphs, and tables
 **Function:** `match_image_to_caption()` — `utils/caption_extractor.py`
 
-For every solar image in `extraction_log.json` (iterated in index order):
+The stage processes **every image actually saved to disk** — i.e. every log entry with a non-null `filename` — not only those the classifier flagged `is_solar`. This keeps the metadata in step with what `extract` wrote: a normal extract only saves solar images (so behaviour is unchanged), while `extract --save-all` saves all kept images and they all receive metadata. The classifier verdict is preserved per observation as `is_solar` + `classifier_score` so a saved-but-non-solar image stays distinguishable downstream.
+
+For every saved image in `extraction_log.json` (iterated in index order):
 
 1. Build a `fitz.Rect` from the image's logged `bbox` (`fitz.Rect(*entry["bbox"])`). Images without a recorded bbox are left without a caption.
 2. Call `match_image_to_caption(page, img_rect, captions_by_page)` to find the nearest caption by vertical gap. The search strategy is:
@@ -197,11 +206,11 @@ The result for each image is:
 ### Step 6: Build prompt and query LLM
 **Functions:** `_query_model()`, `SYSTEM_PROMPT`, `USER_TEMPLATE` — `scripts/metadata_extraction.py`
 
-For each solar image (skipped if both caption and paragraphs are empty), the LLM is called with a focused two-message prompt:
+For each image (skipped only if caption, paragraphs, and referenced tables are all empty), the LLM is called with a focused two-message prompt:
 
-**System message** (`SYSTEM_PROMPT`): instructs the model to return a single JSON object with exactly ten fields, using `null` for absent information. Defines the accepted values for each field and the three `confidence` levels.
+**System message** (`SYSTEM_PROMPT`): instructs the model to return a single JSON object using `null` for absent information. Defines the accepted values for each field and the three `confidence` levels, and asks the model to mine any referenced tables for `active_region`, `heliographic_location`, timestamps and instrument.
 
-**User message** (`USER_TEMPLATE`): embeds the figure label, caption text, and body paragraphs for this specific image:
+**User message** (`USER_TEMPLATE`): embeds the figure label, caption text, body paragraphs, and the caption + raw contents of any tables linked to this figure:
 
 ```
 Extract the observation metadata for the solar image described below.
@@ -215,6 +224,9 @@ Fig. 2. Top: Evolution of the 2010-06-13 prominence eruption at 304 Å ...
 Body text paragraphs referencing this figure:
 - Beginning at 11:10 UT, AIA observed a large kinking loop eruption from AR 11171 ...
 - Fig. 2 shows the same information only for the 2011-03-19 event ...
+
+Referenced tables (caption + raw contents):
+Table 1: Table 1. Information of the white-light flares detected in NOAA AR 11515 Num Date ... S17W08 ...
 ```
 
 This is a per-image call, not a whole-paper call — the LLM sees only the context relevant to the single image being processed.
@@ -312,7 +324,7 @@ HF_HUB_OFFLINE=1 ./tools/extract_plots.sh metadata --paper-name "2012-01 - Labro
 
 ### Prompt design
 
-The LLM receives one call per solar image, not one call per paper. Each call contains only the context for that specific image: the figure label, its full caption, and the body paragraphs that explicitly cite it. This focused context prevents the model from confusing observations from different figures and makes it easier to extract per-image details such as the specific AIA channel shown.
+The LLM receives one call per saved image, not one call per paper. Each call contains only the context for that specific image: the figure label, its full caption, the body paragraphs that explicitly cite it, and the caption + raw contents of any tables linked to it. This focused context prevents the model from confusing observations from different figures and makes it easier to extract per-image details such as the specific AIA channel shown or the NOAA active region listed in a table.
 
 The system prompt instructs the model to:
 1. Return **only** a valid JSON object (not an array) with no surrounding text.
@@ -326,7 +338,7 @@ The `confidence` field is defined as:
 
 ### Token budget
 
-A typical per-image prompt (figure label + caption + a few body paragraphs) is 200–600 tokens. The `max_new_tokens=512` cap is sufficient for a single JSON object with ten fields. Both are well within Qwen2.5's 32 768-token context window.
+A typical per-image prompt (figure label + caption + a few body paragraphs) is 200–600 tokens; a linked table's raw contents can add a few hundred more. The `max_new_tokens=512` cap is sufficient for a single JSON object of metadata fields. Both are well within Qwen2.5's 32 768-token context window.
 
 ---
 
@@ -375,10 +387,15 @@ One file per paper, saved as `<root>/metadata/<name>.json`:
     {
       "observation_filename": "solar_001_p3_aia_false_color.png",
       "figure": 2,
+      "is_solar": true,
+      "classifier_score": 0.6,
       "caption": "Fig. 2. Top: Evolution of the 2010-06-13 prominence eruption at 304 Å ...",
       "paragraphs": [
         "Beginning at 11:10 UT, AIA observed a large kinking loop eruption from AR 11171 ...",
         "Fig. 2 shows the same information only for the 2011-03-19 event ..."
+      ],
+      "referenced_tables": [
+        { "label": "Table 1", "caption": "Table 1. Information of the white-light flares detected in NOAA AR 11515" }
       ],
       "timestamp_start": "2010-06-13T11:10:00",
       "timestamp_end": "2010-06-13T11:40:00",
@@ -389,6 +406,8 @@ One file per paper, saved as `<root>/metadata/<name>.json`:
       "center_tx_arcsec": -750.0,
       "center_ty_arcsec": 300.0,
       "phenomenon": "Prominence",
+      "active_region": "11171",
+      "heliographic_location": "N20W10",
       "confidence": "high"
     },
     {
@@ -432,8 +451,11 @@ One file per paper, saved as `<root>/metadata/<name>.json`:
 |-------|------|--------|-------------|
 | `observation_filename` | string | extraction log | Saved image filename, e.g. `solar_001_p3_aia_false_color.png` |
 | `figure` | integer or `null` | caption label | Leading figure number extracted from the matched caption label |
+| `is_solar` | bool or `null` | extraction log | Classifier verdict recorded at extract time (a saved image may be non-solar under `--save-all`) |
+| `classifier_score` | float or `null` | extraction log | Classifier confidence score recorded at extract time |
 | `caption` | string | PDF caption | Full text of the matched figure caption (for user verification) |
 | `paragraphs` | list of strings | PDF body text | Body paragraphs that explicitly cite this figure (for user verification) |
+| `referenced_tables` | list of `{label, caption}` | PDF tables | Tables linked to this figure whose contents were fed to the LLM (for user verification) |
 | `timestamp_start` | ISO UTC string or `null` | LLM | Start of the observation window |
 | `timestamp_end` | ISO UTC string or `null` | LLM | End of the observation window |
 | `instrument` | string or `null` | LLM | `"AIA"`, `"HMI"`, `"EIT"`, `"LASCO"`, `"XRT"`, etc. |
@@ -443,9 +465,11 @@ One file per paper, saved as `<root>/metadata/<name>.json`:
 | `center_tx_arcsec` | float or `null` | LLM | Heliprojective Tx of the observation center |
 | `center_ty_arcsec` | float or `null` | LLM | Heliprojective Ty of the observation center |
 | `phenomenon` | string or `null` | LLM | Solar structure/event label |
+| `active_region` | string or `null` | LLM | NOAA active-region number, e.g. `"11515"` (often mined from a linked table) |
+| `heliographic_location` | string or `null` | LLM | Heliographic position, e.g. `"S17W08"`; a representative value when several apply |
 | `confidence` | `"high"` / `"medium"` / `"low"` | LLM (defaults to `"low"`) | Drives the SDO query strategy in the `query` stage |
 
-The `caption` and `paragraphs` fields are included so the user can inspect the source text that informed each observation's metadata and verify that the LLM extracted from the correct context.
+The `caption`, `paragraphs`, and `referenced_tables` fields are included so the user can inspect the source text that informed each observation's metadata and verify that the LLM extracted from the correct context. `active_region` / `heliographic_location` give the downstream image-matching step a way to narrow the disk search to a known region and timestamp.
 
 ---
 

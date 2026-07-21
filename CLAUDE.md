@@ -55,6 +55,19 @@ Key cross-cutting design points a change is likely to touch:
   (`match_image_to_caption`) — it does **not** re-derive image bboxes from the PDF. It still opens
   the PDF for caption text and for the body-text paragraphs that cite each figure
   (`extract_figure_body_refs`), which feed the LLM.
+- **`metadata` processes every *saved* image, keyed on `filename` (not the `is_solar` flag).** A
+  normal `extract` only saves solar images, but `extract --save-all` saves more; both get metadata,
+  so the JSON always matches what's on disk. The classifier verdict rides along per observation as
+  `is_solar` + `classifier_score`.
+- **`metadata` also mines tables.** `utils/caption_extractor.py` extracts table caption+body
+  (`extract_all_tables`) and links figures to tables (`extract_figure_table_links`, hybrid:
+  co-citation first, ±4-paragraph window fallback). Linked table text feeds the LLM, which fills the
+  `active_region` / `heliographic_location` fields the downstream matching step uses to narrow the
+  disk search. (`find_tables()` is unreliable on vector A&A tables; the raw `get_text` stream is used
+  instead.)
+- **`metadata` skips the model load when nothing is pending.** `main()` pre-filters papers with
+  existing JSON *before* loading the ~8-min Qwen model; `--verbose`/`-v` adds step-by-step progress
+  logging so a stall is never silent.
 - **One classifier.** `utils/solar_classifier.py` decides *is this image a solar observation*
   using classical CV (Hough circles, HSV palette analysis, HMI grayscale/texture heuristics; raw
   score ≥ 5 → solar). The old zero-shot caption classifier (`structure_classifier_nlp.py`, BART)
@@ -120,5 +133,8 @@ changing a stage's algorithm — they explain the heuristics in detail.
 
 - `notebooks/example_notebook.ipynb` is exploratory (the original sunpy/coordinate-conversion
   prototype) and is not part of the CLI pipeline.
+- `prompts/prompt.md` is a historical planning note (it refers to since-renamed scripts like
+  `stage1_metadata_extraction.py` / `label_plots.py`), not a current spec — don't treat it as
+  authoritative for how a stage behaves today.
 - The VS Code workspace (`SDO_paper_to_observations.code-workspace`) also includes the sibling
   `../NASA_ADS_SDO` project that serves the paper API.

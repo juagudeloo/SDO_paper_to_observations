@@ -91,7 +91,7 @@ USAGE:
 
   metadata:
     ./tools/extract_plots.sh metadata (--paper-name NAME | --all) \
-        [--output-dir DIR] [--model Qwen/Qwen2.5-14B-Instruct]
+        [--output-dir DIR] [--model Qwen/Qwen2.5-14B-Instruct] [--verbose]
 
   query:
     ./tools/extract_plots.sh query (--paper-name NAME | --all) \

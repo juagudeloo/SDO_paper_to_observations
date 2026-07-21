@@ -42,8 +42,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import folder_naming as fn
 from utils.caption_extractor import (
     Caption,
+    Table,
     extract_all_captions,
+    extract_all_tables,
     extract_figure_body_refs,
+    extract_figure_table_links,
     match_image_to_caption,
     _LABEL_NUM_RE,
 )
@@ -62,16 +65,21 @@ single solar observation from the figure caption and body-text excerpts provided
 Return ONLY a valid JSON object — no prose, no markdown fences, no extra keys.
 
 Required fields (use null when the information is absent):
-  timestamp_start     — ISO UTC string e.g. "2012-07-04T09:54:53" or null
-  timestamp_end       — ISO UTC string or null
-  instrument          — "AIA", "HMI", "EIT", "LASCO", "XRT", etc., or null
-  wavelength_angstrom — integer e.g. 171, 193, 304, or null
-  limb_position       — one of "NW","SW","NE","SE","N","S","E","W","disk", or null
-  fov_arcsec          — [width_float, height_float] or null
-  center_tx_arcsec    — float (Heliprojective Tx) or null
-  center_ty_arcsec    — float (Heliprojective Ty) or null
-  phenomenon          — concise label for the solar structure/event (e.g. "Prominence", "Active Region")
-  confidence          — "high" if Tx/Ty explicitly given, "medium" if limb+fov known, "low" otherwise\
+  timestamp_start       — ISO UTC string e.g. "2012-07-04T09:54:53" or null
+  timestamp_end         — ISO UTC string or null
+  instrument            — "AIA", "HMI", "EIT", "LASCO", "XRT", etc., or null
+  wavelength_angstrom   — integer e.g. 171, 193, 304, or null
+  limb_position         — one of "NW","SW","NE","SE","N","S","E","W","disk", or null
+  fov_arcsec            — [width_float, height_float] or null
+  center_tx_arcsec      — float (Heliprojective Tx) or null
+  center_ty_arcsec      — float (Heliprojective Ty) or null
+  phenomenon            — concise label for the solar structure/event (e.g. "Prominence", "Active Region")
+  active_region         — NOAA active-region number as a string e.g. "11515", or null
+  heliographic_location — heliographic position e.g. "S17W08", or null (a representative value when several apply)
+  confidence            — "high" if Tx/Ty explicitly given, "medium" if limb+fov known, "low" otherwise
+
+When "Referenced tables" are provided, mine them for active_region, heliographic_location, \
+timestamps and instrument — tables often list this observational data explicitly.\
 """
 
 USER_TEMPLATE = """\
@@ -84,7 +92,10 @@ Caption:
 {caption}
 
 Body text paragraphs referencing this figure:
-{paragraphs}\
+{paragraphs}
+
+Referenced tables (caption + raw contents):
+{tables}\
 """
 
 
@@ -152,6 +163,7 @@ def _query_model(
     figure_label: str,
     caption_text: str,
     paragraphs: list[str],
+    tables_text: str = "",
 ) -> str:
     paras_str = "\n".join(f"- {p}" for p in paragraphs) if paragraphs else "(none)"
     messages = [
@@ -162,6 +174,7 @@ def _query_model(
                 figure_label=figure_label or "(unknown)",
                 caption=caption_text or "(none)",
                 paragraphs=paras_str,
+                tables=tables_text or "(none)",
             ),
         },
     ]
@@ -218,14 +231,13 @@ def process_paper(
     """
     Process one paper (by canonical name) and write <root>/metadata/<name>.json.
 
-    Returns one of "skipped", "success", or "failed".
+    Returns one of "success" or "failed". Callers are expected to pre-filter
+    papers that already have metadata JSON (see main()).
     """
     out_json = fn.metadata_json(root, name)
 
-    if os.path.exists(out_json):
-        return "skipped"
-
     # Load extraction log (carries the solar images + their page-placement bboxes)
+    logger.info("Loading extraction log for %s", name)
     try:
         log = _load_log(root, name)
     except FileNotFoundError as exc:
@@ -245,22 +257,30 @@ def process_paper(
 
     paper_authors = _pdf_authors(pdf_path) or first_author
 
-    # Captions + body refs still come from the PDF; image bboxes come from the log
+    # Captions + body refs + tables come from the PDF; image bboxes come from the log
     try:
+        logger.info("Extracting captions from %s", pdf_filename)
         captions_by_page = extract_all_captions(pdf_path)
+        logger.info("Extracting figure body references")
         body_refs_by_fig = extract_figure_body_refs(pdf_path)
+        logger.info("Extracting tables and figure->table links")
+        tables_by_num = extract_all_tables(pdf_path)
+        fig_table_links = extract_figure_table_links(pdf_path)
+        logger.debug(
+            "Found %d table(s); figure->table links: %s",
+            len(tables_by_num), fig_table_links,
+        )
     except Exception as exc:
         logger.warning("PDF extraction failed for %s: %s", name, exc)
         _write_result(out_json, pdf_filename, paper_title, paper_authors, [], "failed")
         return "failed"
 
-    # Iterate the solar images recorded by extract, in index order
+    # Iterate the saved images recorded by extract, in index order
     all_entries: list[dict] = sorted(log.get("images", []), key=lambda e: e["index"])
+    saved_entries = [e for e in all_entries if e.get("filename")]
     observations: list[dict] = []
 
-    for entry in all_entries:
-        if not entry.get("is_solar"):
-            continue
+    for i, entry in enumerate(saved_entries, 1):
         obs_filename = entry.get("filename") or f"index_{entry['index']}"
 
         # Match to nearest caption using the bbox recorded at extract time
@@ -279,11 +299,32 @@ def process_paper(
         fig_num = num_match.group(1) if num_match else ""
         paragraphs = body_refs_by_fig.get(fig_num, [])
 
+        # Resolve tables linked to this figure and build the table context text
+        linked_tables: list[Table] = [
+            tables_by_num[n]
+            for n in fig_table_links.get(fig_num, [])
+            if n in tables_by_num
+        ]
+        tables_text = (
+            "\n\n".join(f"{t.label}: {t.body_text}" for t in linked_tables)
+            if linked_tables else ""
+        )
+        referenced_tables = [{"label": t.label, "caption": t.caption} for t in linked_tables]
+
+        logger.info(
+            "  [%d/%d] %s -> %s%s : querying LLM",
+            i, len(saved_entries), obs_filename,
+            figure_label or "(no caption)",
+            f" + {', '.join(t.label for t in linked_tables)}" if linked_tables else "",
+        )
+
         # Query LLM — skip when there is no text context at all
         llm_meta: dict = {}
-        if caption_text or paragraphs:
+        if caption_text or paragraphs or tables_text:
             try:
-                raw = _query_model(tokenizer, model, figure_label, caption_text, paragraphs)
+                raw = _query_model(
+                    tokenizer, model, figure_label, caption_text, paragraphs, tables_text
+                )
                 llm_meta = _parse_llm_output(raw)
             except Exception as exc:
                 logger.warning("LLM query failed for %s / %s: %s", name, obs_filename, exc)
@@ -291,8 +332,11 @@ def process_paper(
         observations.append({
             "observation_filename": obs_filename,
             "figure": _figure_number(figure_label),
+            "is_solar": entry.get("is_solar"),
+            "classifier_score": entry.get("score"),
             "caption": caption_text,
             "paragraphs": paragraphs,
+            "referenced_tables": referenced_tables,
             "timestamp_start": llm_meta.get("timestamp_start"),
             "timestamp_end": llm_meta.get("timestamp_end"),
             "instrument": llm_meta.get("instrument"),
@@ -302,6 +346,8 @@ def process_paper(
             "center_tx_arcsec": llm_meta.get("center_tx_arcsec"),
             "center_ty_arcsec": llm_meta.get("center_ty_arcsec"),
             "phenomenon": llm_meta.get("phenomenon"),
+            "active_region": llm_meta.get("active_region"),
+            "heliographic_location": llm_meta.get("heliographic_location"),
             "confidence": llm_meta.get("confidence") or "low",
         })
 
@@ -365,11 +411,20 @@ def parse_args() -> argparse.Namespace:
         metavar="MODEL",
         help="HuggingFace model identifier (default: Qwen/Qwen2.5-14B-Instruct)",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable step-by-step DEBUG logging (caption/table extraction, per-image LLM queries)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     if not args.paper_name and not args.all:
         print("ERROR: one of --paper-name or --all is required", file=sys.stderr)
@@ -388,19 +443,36 @@ def main() -> None:
         print(f"No papers found under {fn.images_root(root)}")
         return
 
-    print(f"Found {len(names)} paper(s) to process")
+    print(f"Found {len(names)} paper(s) to process", flush=True)
+
+    # Split into pending vs already-done BEFORE loading the model — a paper that
+    # already has metadata JSON should never trigger the (~8 min) model load.
+    pending: list[str] = []
+    n_skipped = 0
+    for name in names:
+        if os.path.exists(fn.metadata_json(root, name)):
+            n_skipped += 1
+            print(f"  [skip]  {name}", flush=True)
+        else:
+            pending.append(name)
+
+    if not pending:
+        print(
+            f"\nSummary: 0 processed, {n_skipped} skipped, 0 failed"
+            f"  (total: {len(names)}) — nothing to do, model not loaded",
+            flush=True,
+        )
+        return
 
     tokenizer, model = load_model(args.model)
 
-    n_processed = n_skipped = n_failed = 0
+    n_processed = n_failed = 0
 
-    for name in names:
+    for i, name in enumerate(pending, 1):
+        logger.info("Processing paper %d/%d: %s", i, len(pending), name)
         status = process_paper(name, root, tokenizer, model)
 
-        if status == "skipped":
-            n_skipped += 1
-            print(f"  [skip]  {name}")
-        elif status == "success":
+        if status == "success":
             n_processed += 1
             try:
                 with open(fn.metadata_json(root, name), encoding="utf-8") as fh:
@@ -408,14 +480,15 @@ def main() -> None:
                 n_obs = len(data.get("observations", []))
             except Exception:
                 n_obs = 0
-            print(f"  [ok]    {name}  ({n_obs} observation(s))")
+            print(f"  [ok]    {name}  ({n_obs} observation(s))", flush=True)
         else:
             n_failed += 1
-            print(f"  [fail]  {name}")
+            print(f"  [fail]  {name}", flush=True)
 
     print(
         f"\nSummary: {n_processed} processed, {n_skipped} skipped, {n_failed} failed"
-        f"  (total: {len(names)})"
+        f"  (total: {len(names)})",
+        flush=True,
     )
 
 

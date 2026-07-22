@@ -20,15 +20,18 @@ Usage:
   python3 extract_plots.py --id 2620529
   python3 extract_plots.py --id 2620529 --output-dir ./output --source arxiv
   python3 extract_plots.py --id 2620529 --no-keep-pdf --min-score 0.25
+  python3 extract_plots.py --id 2620529 --if-exists overwrite --purge-downstream
 """
 
 import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
+from glob import glob
 
 # Allow running as a script from any directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -100,7 +103,157 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--if-exists",
+        choices=["ask", "overwrite", "skip"],
+        default="ask",
+        metavar="{ask,overwrite,skip}",
+        help="What to do if this paper ID was already extracted: prompt "
+             "interactively (default; aborts if stdin is not a TTY), overwrite "
+             "the existing images, or skip extraction entirely",
+    )
+    parser.add_argument(
+        "--purge-downstream",
+        action="store_true",
+        help="When overwriting, also delete this paper's existing metadata JSON "
+             "and matched/ outputs (regenerating them is expensive — an ~8 min "
+             "model load and fresh VSO downloads). Without this flag they are "
+             "left in place with a warning that they may now be stale.",
+    )
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Existing-paper detection and overwrite/skip handling
+# ---------------------------------------------------------------------------
+#
+# Mirrors sdo_query.py's _safe() (kept independent rather than imported, since
+# that stage is owned/evolved separately): sanitizes a canonical paper name for
+# matching the "<safe_name>__*" prefix its output files are saved under.
+_SAFE_RE = re.compile(r"[^\w\-]")
+
+
+def _find_existing_paper_by_id(root: str, paper_id: int) -> tuple[str, dict] | None:
+    """
+    Scan existing extraction logs for a paper with the given ID.
+
+    Reads only <root>/images/*/extraction_log.json (no network calls), since
+    paper_id is already recorded there by a previous `extract` run.
+
+    Returns:
+        (canonical_name, log_data) if found, else None.
+    """
+    for name in fn.iter_paper_names(root):
+        try:
+            with open(fn.log_path(root, name), encoding="utf-8") as fh:
+                log = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if log.get("paper_id") == paper_id:
+            return name, log
+    return None
+
+
+def _find_downstream_artifacts(root: str, name: str) -> tuple[str | None, list[str]]:
+    """Return (metadata_json_path or None, matched_output_paths) for a paper name."""
+    meta_path = fn.metadata_json(root, name)
+    meta = meta_path if os.path.isfile(meta_path) else None
+
+    safe_name = _SAFE_RE.sub("_", name)
+    matched = sorted(glob(os.path.join(fn.matched_dir(root), f"{safe_name}__*")))
+
+    return meta, matched
+
+
+def _warn_stale(meta_path: str | None, matched_files: list[str]) -> None:
+    parts = []
+    if meta_path:
+        parts.append("metadata JSON")
+    if matched_files:
+        parts.append(f"{len(matched_files)} matched output(s)")
+    if parts:
+        print(
+            f"WARNING: existing {' and '.join(parts)} for this paper were NOT "
+            "deleted and may now be stale (they reference the old extraction). "
+            "Re-run metadata/query for this paper if needed, or pass "
+            "--purge-downstream next time.",
+            file=sys.stderr,
+        )
+
+
+def _purge_downstream(meta_path: str | None, matched_files: list[str]) -> None:
+    if meta_path and os.path.isfile(meta_path):
+        os.remove(meta_path)
+        print(f"  Removed stale metadata: {meta_path}")
+    for f in matched_files:
+        os.remove(f)
+    if matched_files:
+        print(f"  Removed {len(matched_files)} stale matched output(s)")
+
+
+def _resolve_overwrite(
+    root: str,
+    existing_name: str,
+    existing_log: dict,
+    if_exists: str,
+    purge_downstream: bool,
+) -> str:
+    """
+    Decide whether to overwrite or skip an already-extracted paper.
+
+    Prompts interactively when if_exists == "ask" and stdin is a TTY; exits
+    the process with an error if confirmation is required but stdin is not
+    interactive (e.g. running under a script/cron without --if-exists set
+    explicitly).
+
+    Returns "overwrite" or "skip".
+    """
+    n_saved = existing_log.get("solar_images_saved", "?")
+
+    if if_exists == "skip":
+        return "skip"
+
+    if if_exists == "overwrite":
+        do_overwrite = True
+    else:  # "ask"
+        if not sys.stdin.isatty():
+            print(
+                f"ERROR: paper id already extracted as '{existing_name}' "
+                f"({n_saved} image(s) saved) and stdin is not interactive. "
+                "Pass --if-exists overwrite or --if-exists skip explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        answer = input(
+            f"Paper '{existing_name}' already exists ({n_saved} image(s) saved). "
+            "Overwrite? [y/N]: "
+        )
+        do_overwrite = answer.strip().lower() in ("y", "yes")
+
+    if not do_overwrite:
+        return "skip"
+
+    meta_path, matched_files = _find_downstream_artifacts(root, existing_name)
+    if meta_path or matched_files:
+        if purge_downstream:
+            _purge_downstream(meta_path, matched_files)
+        elif if_exists == "ask" and sys.stdin.isatty():
+            desc = []
+            if meta_path:
+                desc.append("metadata.json")
+            if matched_files:
+                desc.append(f"{len(matched_files)} matched output(s)")
+            answer = input(
+                f"Also delete existing {' and '.join(desc)} for this paper? [y/N]: "
+            )
+            if answer.strip().lower() in ("y", "yes"):
+                _purge_downstream(meta_path, matched_files)
+            else:
+                _warn_stale(meta_path, matched_files)
+        else:
+            _warn_stale(meta_path, matched_files)
+
+    return "overwrite"
 
 
 def main() -> None:
@@ -108,6 +261,27 @@ def main() -> None:
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # --- 0. Check for an existing extraction of this paper ID ---
+    # Done before any network call: paper_id is already recorded in each
+    # paper's extraction_log.json, so a skip costs nothing but a local scan.
+    found = _find_existing_paper_by_id(args.output_dir, args.id)
+    if found is not None:
+        existing_name, existing_log = found
+        decision = _resolve_overwrite(
+            args.output_dir, existing_name, existing_log, args.if_exists, args.purge_downstream
+        )
+        if decision == "skip":
+            print(f"Skipping — paper id {args.id} already extracted as '{existing_name}'.")
+            return
+        # decision == "overwrite": clear the old images dir + PDF first, so
+        # stale files from a previous run (e.g. a different --min-score) don't
+        # linger alongside the new ones.
+        shutil.rmtree(fn.images_dir(args.output_dir, existing_name), ignore_errors=True)
+        old_pdf = fn.pdf_path(args.output_dir, existing_name)
+        if os.path.isfile(old_pdf):
+            os.remove(old_pdf)
+        print(f"Overwriting existing extraction of '{existing_name}'.\n")
 
     api_url = args.api_url or get_api_base_url()
     check_api_health(api_url)

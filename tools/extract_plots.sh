@@ -87,7 +87,8 @@ USAGE:
     ./tools/extract_plots.sh extract --id PAPER_ID \
         [--output-dir DIR] [--api-url URL] \
         [--source arxiv|publisher] [--no-keep-pdf] \
-        [--save-all] [--min-score 0.25] [--verbose]
+        [--save-all] [--min-score 0.25] [--verbose] \
+        [--if-exists ask|overwrite|skip] [--purge-downstream]
 
   metadata:
     ./tools/extract_plots.sh metadata (--paper-name NAME | --all) \

@@ -154,11 +154,24 @@ The shell script (`tools/extract_plots.sh`) is a thin wrapper that validates the
 **Command:**
 ```bash
 ./tools/extract_plots.sh extract --id 2620529
+./tools/extract_plots.sh extract --id 2620529 --if-exists overwrite --purge-downstream
 ```
 
 **Implemented in:** `scripts/extract_plots.py` (orchestrator), with helpers from `utils/api_client.py`, `utils/folder_naming.py`, `utils/pdf_extractor.py`, and `utils/solar_classifier.py`.
 
 **What it does, step by step:**
+
+### Step 0: Detect a prior extraction of this paper ID
+**Functions:** `_find_existing_paper_by_id()`, `_resolve_overwrite()` — `scripts/extract_plots.py`
+
+Before any network call, scans `<root>/images/*/extraction_log.json` for an entry whose `paper_id` matches `--id` — the ID is already recorded there from a previous `extract` run, so this is a local-only check with no API/download cost.
+
+If a match is found, `--if-exists` decides what happens next:
+- **`skip`** (or answering "no" under `ask`) — prints a message and exits without touching the network.
+- **`overwrite`** (or answering "yes" under `ask`) — deletes the old `images/<name>/` directory and its kept PDF, then the pipeline proceeds as normal from Step 1, rebuilding both from scratch. This prevents orphaned files: since saved-image filenames are numbered per-run (`solar_001_...`, `solar_002_...`), a prior run with a different `--min-score` or `--save-all` could otherwise leave stale files alongside the new ones.
+- **`ask`** (the default) — prompts interactively (`Paper 'X' already exists (N image(s) saved). Overwrite? [y/N]:`). If stdin is not a TTY (e.g. running under a script or cron without `--if-exists` set explicitly), it **aborts with an error instead of hanging** on `input()`.
+
+When overwriting, if `<root>/metadata/<name>.json` and/or `<root>/matched/<name>__*` already exist for this paper (produced by the downstream `metadata`/`query` stages), they are left in place with a warning by default — since regenerating them is expensive (an ~8 min model load for `metadata`, fresh VSO downloads for `query`). Pass `--purge-downstream` to also delete them (under interactive `ask`, this is a second, separate y/N prompt instead).
 
 ### Step 1: Fetch metadata
 **Function:** `get_document_by_id(base_url, doc_id)` — `utils/api_client.py`

@@ -48,6 +48,15 @@ Key cross-cutting design points a change is likely to touch:
   resolves every canonical path (`pdf_path`, `images_dir`, `log_path`, `metadata_json`,
   `matched_dir`, `fits_dir`, plus `iter_paper_names` for `--all`). No stage hardcodes `output/...`
   paths — changing the layout is a one-file change here.
+- **`extract --id` detects a re-extraction before touching the network.** `paper_id` is recorded
+  in every `extraction_log.json`, so `_find_existing_paper_by_id()` scans existing logs locally
+  first. `--if-exists {ask,overwrite,skip}` (default `ask`) decides what to do; `ask` prompts
+  interactively and **aborts if stdin is not a TTY** (never hangs under a script/cron). Overwriting
+  clears the old `images/<name>/` + PDF first, so stale files from a differently-configured prior
+  run (e.g. a different `--min-score`) don't linger. Existing `metadata/<name>.json` /
+  `matched/<name>__*` are left in place with a warning unless `--purge-downstream` is also passed
+  (kept opt-in since regenerating them is expensive: an ~8 min model load, fresh VSO downloads) —
+  in interactive `ask` mode this is a second, separate prompt.
 - **Image geometry is captured once, at extract.** `utils/pdf_extractor.py` records each image's
   page-placement `bbox`; `extract_plots.py` writes it (with the saved PNG `filename`) into
   `extraction_log.json`. Downstream `metadata` reads the bbox from the log and matches to the
@@ -55,10 +64,18 @@ Key cross-cutting design points a change is likely to touch:
   (`match_image_to_caption`) — it does **not** re-derive image bboxes from the PDF. It still opens
   the PDF for caption text and for the body-text paragraphs that cite each figure
   (`extract_figure_body_refs`), which feed the LLM.
-- **`metadata` processes every *saved* image, keyed on `filename` (not the `is_solar` flag).** A
-  normal `extract` only saves solar images, but `extract --save-all` saves more; both get metadata,
-  so the JSON always matches what's on disk. The classifier verdict rides along per observation as
-  `is_solar` + `classifier_score`.
+- **`metadata`'s observation unit is the *figure*, not the raster.** Saved images (keyed on
+  `filename`, not `is_solar`) are matched to their caption, then **grouped by figure number**
+  (`_group_images_by_figure`); uncaptioned images each form their own group so nothing is dropped.
+  Each figure becomes one observation record with a `panels[]` array — one entry per sub-panel
+  (a, b, c…) parsed from the caption, since a multi-panel figure is several distinct observations
+  (different instrument/wavelength/time) and the raster count never matches the panel count. The
+  record carries figure-level `caption`/`paragraphs`/`referenced_tables`/`active_region`/`phenomenon`
+  and `source_images` (the rasters, each with its `is_solar` + `classifier_score`). Each panel has
+  `image_kind` (`intensity`|`magnetogram`|`difference`|`ratio`|`lightcurve`|`other`), instrument,
+  wavelength, timestamps, coords, `heliographic_location`, `derived_from`. The nested shape keeps a
+  figure's panel *sequence* together (useful for spatiotemporal models and as a VLM training target).
+  Per-panel burned-in timestamps await a later OCR phase.
 - **`metadata` also mines tables.** `utils/caption_extractor.py` extracts table caption+body
   (`extract_all_tables`) and links figures to tables (`extract_figure_table_links`, hybrid:
   co-citation first, ±4-paragraph window fallback). Linked table text feeds the LLM, which fills the
@@ -74,8 +91,12 @@ Key cross-cutting design points a change is likely to touch:
   was removed — the metadata LLM's `phenomenon` field supersedes it.
 - **Model cache is redirected into the repo.** `metadata_extraction.py` sets `HF_HOME` to
   `models/` before importing `transformers`; the Qwen weights download there, not to `~/.cache`.
-- **Metadata LLM:** `Qwen/Qwen2.5-14B-Instruct`, 8-bit quantised (needs `bitsandbytes` + GPU).
-  It reads caption + citing paragraphs per image and emits structured observation metadata.
+- **Metadata LLM:** `Qwen/Qwen2.5-14B-Instruct`, 8-bit quantised (needs `bitsandbytes` + GPU). One
+  call per figure: it reads caption + citing paragraphs + linked tables and emits the figure record
+  with its `panels[]` array (`max_new_tokens` raised to fit many panels).
+- **`query` (owned separately) consumes the metadata `panels[]` schema.** Each observation record is
+  a figure with a `panels[]` array; a panel's `image_kind` says whether it is a fetchable SDO frame
+  (`intensity`/`magnetogram`) or a derived/non-frame panel (`difference`/`ratio`/`lightcurve`/`other`).
 - **`query` has three fallback strategies** (see `LIMB_BOXES` / strategy A/B/C in
   `sdo_query.py`), degrading from explicit Heliprojective Tx/Ty + FOV (`high` confidence),
   to an approximate limb bounding box (`medium`), to a full-disk map for downstream CV (`low`).

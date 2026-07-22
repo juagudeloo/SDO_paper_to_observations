@@ -60,30 +60,58 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are an expert solar physicist assistant. Extract structured metadata for a \
-single solar observation from the figure caption and body-text excerpts provided. \
-Return ONLY a valid JSON object — no prose, no markdown fences, no extra keys.
+You are an expert solar physicist assistant. A scientific figure is described by its \
+caption, the body-text paragraphs that cite it, and any referenced tables. The figure \
+may contain several sub-panels labelled (a), (b), (c), … — each a DISTINCT observation \
+with its own instrument, wavelength, time and role. Extract structured metadata for the \
+whole figure as ONE JSON object with a "panels" array. Return ONLY valid JSON — no prose, \
+no markdown fences, no extra keys.
 
-Required fields (use null when the information is absent):
+Figure-level fields (use null when absent):
+  figure_label          — the figure label e.g. "Figure 5"
+  phenomenon            — concise label for the solar structure/event (e.g. "Prominence", "White-light flare")
+  active_region         — NOAA active-region number as a string e.g. "11515", or null (shared by all panels)
+  panels                — array of panel objects (see below)
+
+Each panel object (use null when the information is absent):
+  panel                 — panel letter e.g. "a", or null if the figure has no sub-panels
+  description           — one concise phrase describing this panel
+  image_kind            — one of "intensity", "magnetogram", "difference", "ratio", "lightcurve", "other"
+                          ("difference"/"ratio" = derived from two frames; "lightcurve" = a time-series plot)
+  instrument            — "AIA", "HMI", "EIT", "LASCO", "XRT", etc., or null
+  wavelength_angstrom   — integer e.g. 171, 193, 304, 1600, or null
   timestamp_start       — ISO UTC string e.g. "2012-07-04T09:54:53" or null
   timestamp_end         — ISO UTC string or null
-  instrument            — "AIA", "HMI", "EIT", "LASCO", "XRT", etc., or null
-  wavelength_angstrom   — integer e.g. 171, 193, 304, or null
   limb_position         — one of "NW","SW","NE","SE","N","S","E","W","disk", or null
   fov_arcsec            — [width_float, height_float] or null
   center_tx_arcsec      — float (Heliprojective Tx) or null
   center_ty_arcsec      — float (Heliprojective Ty) or null
-  phenomenon            — concise label for the solar structure/event (e.g. "Prominence", "Active Region")
-  active_region         — NOAA active-region number as a string e.g. "11515", or null
-  heliographic_location — heliographic position e.g. "S17W08", or null (a representative value when several apply)
+  heliographic_location — heliographic position e.g. "S17W08", or null (per-panel; may differ)
+  derived_from          — for "difference"/"ratio" panels, the source panel letters e.g. ["d","e"], else null
   confidence            — "high" if Tx/Ty explicitly given, "medium" if limb+fov known, "low" otherwise
 
-When "Referenced tables" are provided, mine them for active_region, heliographic_location, \
-timestamps and instrument — tables often list this observational data explicitly.\
+Rules:
+- Enumerate EVERY panel. Expand ranges and lists: "(b)-(e)" → b, c, d, e; "(b) and (d)" → b, d.
+- If the caption describes no sub-panels, return exactly one panel with "panel": null.
+- Mine the referenced tables and body text for active_region, heliographic_location, timestamps
+  and instrument — tables often list this observational data explicitly.
+
+Example output:
+{"figure_label": "Figure 5", "phenomenon": "White-light flare", "active_region": "11515",
+ "panels": [
+   {"panel": "a", "description": "AIA 1600 image at peak", "image_kind": "intensity",
+    "instrument": "AIA", "wavelength_angstrom": 1600, "timestamp_start": null, "timestamp_end": null,
+    "limb_position": "disk", "fov_arcsec": null, "center_tx_arcsec": null, "center_ty_arcsec": null,
+    "heliographic_location": "S18W29", "derived_from": null, "confidence": "low"},
+   {"panel": "f", "description": "difference image (peak - beginning)", "image_kind": "difference",
+    "instrument": "HMI", "wavelength_angstrom": null, "timestamp_start": null, "timestamp_end": null,
+    "limb_position": "disk", "fov_arcsec": null, "center_tx_arcsec": null, "center_ty_arcsec": null,
+    "heliographic_location": "S18W29", "derived_from": ["d","e"], "confidence": "low"}
+ ]}\
 """
 
 USER_TEMPLATE = """\
-Extract the observation metadata for the solar image described below.
+Extract the figure metadata (with one entry per panel) for the figure described below.
 Return ONLY a JSON object.
 
 Figure: {figure_label}
@@ -97,6 +125,32 @@ Body text paragraphs referencing this figure:
 Referenced tables (caption + raw contents):
 {tables}\
 """
+
+
+# Per-panel keys emitted in the output (normalised from the LLM response).
+_PANEL_KEYS = (
+    "panel",
+    "description",
+    "image_kind",
+    "instrument",
+    "wavelength_angstrom",
+    "timestamp_start",
+    "timestamp_end",
+    "limb_position",
+    "fov_arcsec",
+    "center_tx_arcsec",
+    "center_ty_arcsec",
+    "heliographic_location",
+    "derived_from",
+    "confidence",
+)
+
+
+def _normalize_panel(raw: dict) -> dict:
+    """Coerce a raw LLM panel dict to the canonical key set, filling missing keys."""
+    panel = {k: raw.get(k) for k in _PANEL_KEYS}
+    panel["confidence"] = raw.get("confidence") or "low"
+    return panel
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +241,7 @@ def _query_model(
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=512,
+            max_new_tokens=2048,  # a multi-panel figure can emit many panel objects
             temperature=0.1,
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
@@ -275,36 +329,27 @@ def process_paper(
         _write_result(out_json, pdf_filename, paper_title, paper_authors, [], "failed")
         return "failed"
 
-    # Iterate the saved images recorded by extract, in index order
+    # Match every saved image to its caption, then group images by figure so each
+    # figure (not each raster) becomes one observation record with a panels[] array.
     all_entries: list[dict] = sorted(log.get("images", []), key=lambda e: e["index"])
     saved_entries = [e for e in all_entries if e.get("filename")]
+
+    groups = _group_images_by_figure(saved_entries, captions_by_page)
     observations: list[dict] = []
 
-    for i, entry in enumerate(saved_entries, 1):
-        obs_filename = entry.get("filename") or f"index_{entry['index']}"
+    for i, group in enumerate(groups, 1):
+        caption_text = group["caption_text"]
+        figure_label = group["figure_label"]
+        fig_num = group["fig_num"]
 
-        # Match to nearest caption using the bbox recorded at extract time
-        caption: Caption | None = None
-        bbox = entry.get("bbox")
-        if bbox:
-            img_rect = fitz.Rect(*bbox)
-            caption, _conf = match_image_to_caption(
-                entry["page"], img_rect, captions_by_page
-            )
-        caption_text = caption.text if caption else ""
-        figure_label = caption.figure_label if caption else ""
-
-        # Get body paragraphs for this figure number
-        num_match = _LABEL_NUM_RE.search(figure_label) if figure_label else None
-        fig_num = num_match.group(1) if num_match else ""
-        paragraphs = body_refs_by_fig.get(fig_num, [])
+        paragraphs = body_refs_by_fig.get(fig_num, []) if fig_num else []
 
         # Resolve tables linked to this figure and build the table context text
         linked_tables: list[Table] = [
             tables_by_num[n]
             for n in fig_table_links.get(fig_num, [])
             if n in tables_by_num
-        ]
+        ] if fig_num else []
         tables_text = (
             "\n\n".join(f"{t.label}: {t.body_text}" for t in linked_tables)
             if linked_tables else ""
@@ -312,9 +357,9 @@ def process_paper(
         referenced_tables = [{"label": t.label, "caption": t.caption} for t in linked_tables]
 
         logger.info(
-            "  [%d/%d] %s -> %s%s : querying LLM",
-            i, len(saved_entries), obs_filename,
-            figure_label or "(no caption)",
+            "  [%d/%d] %s (%d image(s))%s : querying LLM",
+            i, len(groups), figure_label or "(no caption)",
+            len(group["entries"]),
             f" + {', '.join(t.label for t in linked_tables)}" if linked_tables else "",
         )
 
@@ -327,33 +372,86 @@ def process_paper(
                 )
                 llm_meta = _parse_llm_output(raw)
             except Exception as exc:
-                logger.warning("LLM query failed for %s / %s: %s", name, obs_filename, exc)
+                logger.warning("LLM query failed for %s / %s: %s", name, figure_label, exc)
+
+        # Normalise panels; guarantee at least one (single-panel fallback)
+        raw_panels = llm_meta.get("panels")
+        if not isinstance(raw_panels, list) or not raw_panels:
+            raw_panels = [{}]
+        panels = [_normalize_panel(p if isinstance(p, dict) else {}) for p in raw_panels]
+
+        source_images = [
+            {
+                "filename": e.get("filename"),
+                "is_solar": e.get("is_solar"),
+                "classifier_score": e.get("score"),
+            }
+            for e in group["entries"]
+        ]
 
         observations.append({
-            "observation_filename": obs_filename,
             "figure": _figure_number(figure_label),
-            "is_solar": entry.get("is_solar"),
-            "classifier_score": entry.get("score"),
+            "figure_label": figure_label,
             "caption": caption_text,
             "paragraphs": paragraphs,
             "referenced_tables": referenced_tables,
-            "timestamp_start": llm_meta.get("timestamp_start"),
-            "timestamp_end": llm_meta.get("timestamp_end"),
-            "instrument": llm_meta.get("instrument"),
-            "wavelength_angstrom": llm_meta.get("wavelength_angstrom"),
-            "limb_position": llm_meta.get("limb_position"),
-            "fov_arcsec": llm_meta.get("fov_arcsec"),
-            "center_tx_arcsec": llm_meta.get("center_tx_arcsec"),
-            "center_ty_arcsec": llm_meta.get("center_ty_arcsec"),
+            "source_images": source_images,
             "phenomenon": llm_meta.get("phenomenon"),
             "active_region": llm_meta.get("active_region"),
-            "heliographic_location": llm_meta.get("heliographic_location"),
-            "confidence": llm_meta.get("confidence") or "low",
+            "panels": panels,
         })
 
     status = "success" if observations else "failed"
     _write_result(out_json, pdf_filename, paper_title, paper_authors, observations, status)
     return status
+
+
+def _group_images_by_figure(
+    saved_entries: list[dict],
+    captions_by_page: dict,
+) -> list[dict]:
+    """
+    Group saved images by their matched figure caption.
+
+    Each saved image is matched to its nearest caption (via the bbox recorded at
+    extract time). Images that share a figure number are grouped together; images
+    that match no caption each form their own single-image group (keyed on filename)
+    so nothing is dropped.
+
+    Returns a list of group dicts, in first-appearance order, each with keys:
+    ``fig_num`` (str, "" when no caption), ``figure_label``, ``caption_text``,
+    and ``entries`` (the log entries in the group).
+    """
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+
+    for entry in saved_entries:
+        caption: Caption | None = None
+        bbox = entry.get("bbox")
+        if bbox:
+            img_rect = fitz.Rect(*bbox)
+            caption, _conf = match_image_to_caption(
+                entry["page"], img_rect, captions_by_page
+            )
+        caption_text = caption.text if caption else ""
+        figure_label = caption.figure_label if caption else ""
+
+        num_match = _LABEL_NUM_RE.search(figure_label) if figure_label else None
+        fig_num = num_match.group(1) if num_match else ""
+
+        # Key: figure number when known, else a unique key per uncaptioned image
+        key = fig_num if fig_num else f"__img__{entry.get('filename')}"
+        if key not in groups:
+            groups[key] = {
+                "fig_num": fig_num,
+                "figure_label": figure_label,
+                "caption_text": caption_text,
+                "entries": [],
+            }
+            order.append(key)
+        groups[key]["entries"].append(entry)
+
+    return [groups[k] for k in order]
 
 
 def _write_result(

@@ -16,12 +16,17 @@ satellite with images published in scientific papers. Given a corpus of SDO pape
   - The `metadata` stage also needs `bitsandbytes` and `accelerate`, plus a GPU.
   - The `query` stage also needs `sunpy` and `astropy`.
   - The launcher checks these per command and prints an install hint if anything is missing.
-- The **NASA ADS SDO API** running (needed for `list` and `extract`). It lives in the sibling
-  repository `../NASA_ADS_SDO`
-  ([juagudeloo/NASA_ADS_SDO](https://github.com/juagudeloo/NASA_ADS_SDO)):
+- The **NASA ADS SDO API** running (needed for `list` and `extract`). Its source lives in this
+  repo under [`nasa_ads_sdo/`](nasa_ads_sdo/README.md) — a small FastAPI service over a
+  pre-populated SQLite database of ~30,000 SDO papers, with its own Python environment (unrelated
+  to `pytorch_jupyter`). First-time setup, then day-to-day usage:
 
   ```bash
-  cd ../NASA_ADS_SDO && ./run_api.sh
+  cd nasa_ads_sdo && ./setup.sh        # one-time: creates nasa_ads_sdo/venv/
+  cd ..
+  ./tools/extract_plots.sh api start
+  ./tools/extract_plots.sh api status
+  ./tools/extract_plots.sh api stop
   ```
 
   By default the tools talk to `http://localhost:8000`; override with the `SDO_API_URL` variable.

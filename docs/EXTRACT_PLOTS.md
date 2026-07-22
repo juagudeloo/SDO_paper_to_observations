@@ -48,15 +48,16 @@ addressing a paper by its canonical name. See `docs/METADATA_EXTRACTION.md` and
 
 ### 1. Start the NASA ADS SDO API
 
-The API reads from a local SQLite database of ~30,000 SDO papers (2010–2024).
+The API reads from a local SQLite database of ~30,000 SDO papers (2010–2024). Its source lives
+in-repo under `nasa_ads_sdo/` (first time only: `cd nasa_ads_sdo && ./setup.sh`).
 
 ```bash
-cd ../NASA_ADS_SDO
-./run_api.sh          # starts at http://localhost:8000
+./tools/extract_plots.sh api start   # starts at http://localhost:8000
 ```
 
 Verify it is running:
 ```bash
+./tools/extract_plots.sh api status
 curl http://localhost:8000/
 # Expected: {"message": "SDO Documents API", "version": "...", "docs": "/docs"}
 ```
@@ -412,8 +413,8 @@ output/
 ## End-to-End Example
 
 ```bash
-# 1. Start the API (in a separate terminal)
-cd ../NASA_ADS_SDO && ./run_api.sh
+# 1. Start the API (runs in the background; check anytime with `api status`)
+./tools/extract_plots.sh api start
 
 # 2. List papers from 2012 to 2013
 ./tools/extract_plots.sh list --start 2012-01-01 --end 2013-12-31

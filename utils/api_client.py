@@ -18,14 +18,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-NASA_ADS_SDO_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "..", "NASA_ADS_SDO"
-)
-_START_HINT = (
-    f"Start the API with:\n"
-    f"  cd {os.path.abspath(NASA_ADS_SDO_DIR)}\n"
-    f"  ./run_api.sh"
-)
+_START_HINT = "Start the API with:\n  ./tools/extract_plots.sh api start"
 
 
 def get_api_base_url() -> str:

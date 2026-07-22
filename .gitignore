@@ -6,6 +6,19 @@ prompts/
 LightGlue/
 *.code-workspace
 data/
+
+# nasa_ads_sdo/ — NASA ADS SDO API service (setup.sh-generated + runtime artifacts)
+nasa_ads_sdo/run_api.sh
+nasa_ads_sdo/run_dev.sh
+nasa_ads_sdo/nohup.out
+nasa_ads_sdo/*.pid
+nasa_ads_sdo/api/database/*.db.backup
+nasa_ads_sdo/api/database/*.db.bak
+nasa_ads_sdo/api/database/*.sqlite.backup
+nasa_ads_sdo/test_*.pdf
+nasa_ads_sdo/paper*.pdf
+nasa_ads_sdo/download_*.pdf
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

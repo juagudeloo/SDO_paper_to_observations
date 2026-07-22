@@ -39,9 +39,11 @@ failed/    ...                                 (failures)
 
 Key cross-cutting design points a change is likely to touch:
 
-- **`utils/api_client.py` is the sole gateway to the external NASA ADS SDO API.** The API base
-  URL comes from `SDO_API_URL` (default `http://localhost:8000`). Stages `list`/`extract` require
-  it running; it lives in the sibling repo `../NASA_ADS_SDO` and is started with `./run_api.sh`.
+- **`utils/api_client.py` is the sole gateway to the NASA ADS SDO API.** The API base URL comes
+  from `SDO_API_URL` (default `http://localhost:8000`). Stages `list`/`extract` require it running.
+  Its source lives in-repo under `nasa_ads_sdo/` (FastAPI + SQLite, its own `venv/`, fully isolated
+  from the `pytorch_jupyter` conda env) and is managed with
+  `./tools/extract_plots.sh api {start,stop,status}` (one-time setup: `cd nasa_ads_sdo && ./setup.sh`).
 - **Folder naming and the layout are canonical and shared.** `utils/folder_naming.py` builds the
   `YYYY-MM - LastName, F` name from paper metadata (the DB stores dates as `YYYY-MM-00`, and its
   authors field is empty, so the first author is parsed out of the PDF's first-page text), *and*
@@ -157,5 +159,6 @@ changing a stage's algorithm — they explain the heuristics in detail.
 - `prompts/prompt.md` is a historical planning note (it refers to since-renamed scripts like
   `stage1_metadata_extraction.py` / `label_plots.py`), not a current spec — don't treat it as
   authoritative for how a stage behaves today.
-- The VS Code workspace (`SDO_paper_to_observations.code-workspace`) also includes the sibling
-  `../NASA_ADS_SDO` project that serves the paper API.
+- The NASA ADS SDO API's own docs live at `nasa_ads_sdo/CLAUDE.md` and `nasa_ads_sdo/README.md`
+  (its routing-order gotcha, `sdo_database.py`'s cwd-relative invocation contract, Docker/Makefile
+  usage, etc. — details irrelevant to the pipeline itself, which only sees it as an HTTP service).

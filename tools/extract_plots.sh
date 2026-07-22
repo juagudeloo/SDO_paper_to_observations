@@ -31,6 +31,11 @@
 #   Run unit tests:
 #     ./tools/extract_plots.sh test
 #
+#   Manage the NASA ADS SDO API (needed by list/extract):
+#     ./tools/extract_plots.sh api start
+#     ./tools/extract_plots.sh api status
+#     ./tools/extract_plots.sh api stop
+#
 # ENVIRONMENT VARIABLES
 #   SDO_API_URL   Override API base URL (default: http://localhost:8000)
 #   CONDA_ENV     Override conda environment name (default: pytorch_jupyter)
@@ -41,7 +46,8 @@
 #   - transformers + bitsandbytes  [required for the metadata stage LLM]
 #   - sunpy + astropy              [required for the query stage]
 #   - NASA ADS SDO API running:
-#       cd ../NASA_ADS_SDO && ./run_api.sh
+#       ./tools/extract_plots.sh api start
+#     (one-time setup: cd nasa_ads_sdo && ./setup.sh — separate venv, not conda)
 # =============================================================================
 
 set -euo pipefail
@@ -53,6 +59,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 SCRIPTS_DIR="$PROJECT_ROOT/scripts"
 CONDA_ENV="${CONDA_ENV:-pytorch_jupyter}"
+
+# The NASA ADS SDO API lives in-repo under nasa_ads_sdo/ with its own isolated
+# venv (fastapi/uvicorn/sqlmodel) — unrelated to $CONDA_ENV.
+NASA_ADS_SDO_DIR="$PROJECT_ROOT/nasa_ads_sdo"
+API_PIDFILE="$NASA_ADS_SDO_DIR/.api.pid"
+API_LOGFILE="$NASA_ADS_SDO_DIR/api_server.log"
+API_URL="${SDO_API_URL:-http://localhost:8000}"
 
 # On systems where the OS libstdc++ is older than what conda packages require
 # (e.g. GLIBCXX_3.4.29 missing), conda run spawns a fresh subprocess that
@@ -76,6 +89,7 @@ COMMANDS:
   extract   Extract solar observation images into the canonical output layout
   metadata  Extract structured observation metadata from a paper via LLM
   query     Query SDO/VSO archive and produce cropped submaps
+  api       Manage the NASA ADS SDO API service (start | stop | status)
   test      Run unit tests
 
 USAGE:
@@ -97,6 +111,12 @@ USAGE:
   query:
     ./tools/extract_plots.sh query (--paper-name NAME | --all) \
         [--output-dir DIR] [--fits-dir DIR]
+
+  api:
+    ./tools/extract_plots.sh api start    # launch the API in the background
+    ./tools/extract_plots.sh api stop     # stop it
+    ./tools/extract_plots.sh api status   # check whether it's running
+    (one-time setup: cd nasa_ads_sdo && ./setup.sh)
 
 EXAMPLES:
   # List papers from 2012-01-02 to 2013-03-01 (saves CSV + Markdown to output/searched_papers/)
@@ -122,7 +142,7 @@ ENVIRONMENT VARIABLES:
   CONDA_ENV     Conda env     (default: pytorch_jupyter)
 
 Before running list/extract, start the API:
-  cd ../NASA_ADS_SDO && ./run_api.sh
+  ./tools/extract_plots.sh api start
 EOF
     exit 0
 }
@@ -185,6 +205,112 @@ check_conda_env() {
 }
 
 # ---------------------------------------------------------------------------
+# API service lifecycle (nasa_ads_sdo/) — isolated from $CONDA_ENV entirely,
+# so this never goes through check_system_tools/check_conda_env.
+# ---------------------------------------------------------------------------
+
+_api_pid_alive() {
+    [[ -f "$API_PIDFILE" ]] || return 1
+    local pid
+    pid="$(cat "$API_PIDFILE" 2>/dev/null)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_api() {
+    local sub="${1:-}"
+    case "$sub" in
+        start)
+            if _api_pid_alive; then
+                echo "NASA ADS SDO API is already running (pid $(cat "$API_PIDFILE")) at $API_URL"
+                exit 0
+            fi
+            rm -f "$API_PIDFILE"
+
+            if [[ ! -x "$NASA_ADS_SDO_DIR/run_api.sh" ]]; then
+                echo "ERROR: nasa_ads_sdo/run_api.sh not found (one-time setup required)." >&2
+                echo "       Run:" >&2
+                echo "         cd nasa_ads_sdo && ./setup.sh" >&2
+                exit 1
+            fi
+
+            # `set -m` in a subshell gives the backgrounded job its own process
+            # group (PGID == PID), so `stop` can later signal the whole tree
+            # (run_api.sh's shell + the uvicorn --reload supervisor/worker it
+            # execs in the foreground) rather than just the wrapper process.
+            ( set -m
+              nohup "$NASA_ADS_SDO_DIR/run_api.sh" >"$API_LOGFILE" 2>&1 < /dev/null &
+              echo $! > "$API_PIDFILE"
+            )
+
+            local pid waited=0
+            pid="$(cat "$API_PIDFILE")"
+            while (( waited < 30 )); do
+                if curl -sf "$API_URL/" >/dev/null 2>&1; then
+                    echo "NASA ADS SDO API is up at $API_URL (pid $pid)"
+                    exit 0
+                fi
+                sleep 0.5
+                waited=$((waited + 1))
+            done
+            echo "ERROR: API did not respond within 15s — check $API_LOGFILE" >&2
+            exit 1
+            ;;
+        stop)
+            if [[ ! -f "$API_PIDFILE" ]]; then
+                echo "NASA ADS SDO API is not running (no pidfile)."
+                exit 0
+            fi
+            local pid
+            pid="$(cat "$API_PIDFILE" 2>/dev/null)"
+            if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+                echo "NASA ADS SDO API was not running (stale pidfile removed)."
+                rm -f "$API_PIDFILE"
+                exit 0
+            fi
+
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+            local waited=0
+            while (( waited < 10 )) && kill -0 "$pid" 2>/dev/null; do
+                sleep 0.5
+                waited=$((waited + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+            fi
+            # Defensive cleanup in case anything escaped the process group.
+            # Matched on the venv's own uvicorn path specifically (not a loose
+            # "nasa_ads_sdo.*uvicorn" substring) — that pattern is broad enough
+            # to accidentally match unrelated commands merely mentioning both
+            # words (e.g. a ps/grep diagnostic), which would kill the wrong
+            # process.
+            pkill -f "$NASA_ADS_SDO_DIR/venv/bin/uvicorn" 2>/dev/null || true
+            rm -f "$API_PIDFILE"
+            echo "NASA ADS SDO API stopped (pid $pid)."
+            exit 0
+            ;;
+        status)
+            if _api_pid_alive; then
+                local pid
+                pid="$(cat "$API_PIDFILE")"
+                if curl -sf "$API_URL/" >/dev/null 2>&1; then
+                    echo "NASA ADS SDO API: running (pid $pid) at $API_URL"
+                else
+                    echo "NASA ADS SDO API: process running (pid $pid) but not responding at $API_URL"
+                fi
+                exit 0
+            else
+                echo "NASA ADS SDO API: not running"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Usage: ./tools/extract_plots.sh api {start|stop|status}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -194,6 +320,15 @@ fi
 
 COMMAND="$1"
 shift
+
+# api never touches $CONDA_ENV (it has its own isolated venv), so it's
+# dispatched before check_system_tools/check_conda_env — cmd_api always
+# exits itself.
+if [[ "$COMMAND" == "api" ]]; then
+    cmd_api "$@"
+    exit $?  # defensive: cmd_api's branches always exit themselves, but never
+             # let a future bug fall through into the ML-pipeline checks below
+fi
 
 # Validate environment before dispatching
 check_system_tools
@@ -224,7 +359,7 @@ case "$COMMAND" in
         ;;
     *)
         echo "ERROR: Unknown command '$COMMAND'." >&2
-        echo "       Use: list | extract | metadata | query | test" >&2
+        echo "       Use: list | extract | metadata | query | api | test" >&2
         echo "       Run './tools/extract_plots.sh --help' for usage." >&2
         exit 1
         ;;

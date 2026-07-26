@@ -64,8 +64,12 @@ CONDA_ENV="${CONDA_ENV:-pytorch_jupyter}"
 # venv (fastapi/uvicorn/sqlmodel) — unrelated to $CONDA_ENV.
 NASA_ADS_SDO_DIR="$PROJECT_ROOT/nasa_ads_sdo"
 API_PIDFILE="$NASA_ADS_SDO_DIR/.api.pid"
+API_EXPIRYFILE="$NASA_ADS_SDO_DIR/.api.expiry"
 API_LOGFILE="$NASA_ADS_SDO_DIR/api_server.log"
 API_URL="${SDO_API_URL:-http://localhost:8000}"
+# Auto-stop timeout for `api start`, in minutes; 0 disables it. Easy to forget
+# a locally-started API running indefinitely, so this defaults to on.
+API_DEFAULT_TIMEOUT_MIN="${SDO_API_TIMEOUT_MIN:-120}"
 
 # On systems where the OS libstdc++ is older than what conda packages require
 # (e.g. GLIBCXX_3.4.29 missing), conda run spawns a fresh subprocess that
@@ -113,9 +117,11 @@ USAGE:
         [--output-dir DIR] [--fits-dir DIR]
 
   api:
-    ./tools/extract_plots.sh api start    # launch the API in the background
+    ./tools/extract_plots.sh api start [--timeout MINUTES]
+        # launch the API in the background; auto-stops after MINUTES
+        # (default 120, override with $SDO_API_TIMEOUT_MIN; --timeout 0 disables it)
     ./tools/extract_plots.sh api stop     # stop it
-    ./tools/extract_plots.sh api status   # check whether it's running
+    ./tools/extract_plots.sh api status   # check whether it's running (+ time left)
     (one-time setup: cd nasa_ads_sdo && ./setup.sh)
 
 EXAMPLES:
@@ -216,15 +222,38 @@ _api_pid_alive() {
     [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+_api_time_left_human() {
+    # Prints "Xh Ym"/"Ym" remaining until $1 (an epoch second), or nothing if
+    # already past.
+    local expiry="$1" now remaining
+    now="$(date +%s)"
+    remaining=$(( expiry - now ))
+    (( remaining > 0 )) || return 1
+    if (( remaining >= 3600 )); then
+        printf '%dh %dm' "$(( remaining / 3600 ))" "$(( (remaining % 3600) / 60 ))"
+    else
+        printf '%dm' "$(( (remaining + 59) / 60 ))"
+    fi
+}
+
 cmd_api() {
     local sub="${1:-}"
+    shift || true
     case "$sub" in
         start)
             if _api_pid_alive; then
                 echo "NASA ADS SDO API is already running (pid $(cat "$API_PIDFILE")) at $API_URL"
                 exit 0
             fi
-            rm -f "$API_PIDFILE"
+            rm -f "$API_PIDFILE" "$API_EXPIRYFILE"
+
+            local timeout_min="$API_DEFAULT_TIMEOUT_MIN"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --timeout) timeout_min="$2"; shift 2 ;;
+                    *) shift ;;
+                esac
+            done
 
             if [[ ! -x "$NASA_ADS_SDO_DIR/run_api.sh" ]]; then
                 echo "ERROR: nasa_ads_sdo/run_api.sh not found (one-time setup required)." >&2
@@ -247,6 +276,7 @@ cmd_api() {
             while (( waited < 30 )); do
                 if curl -sf "$API_URL/" >/dev/null 2>&1; then
                     echo "NASA ADS SDO API is up at $API_URL (pid $pid)"
+                    _api_arm_watchdog "$pid" "$timeout_min"
                     exit 0
                 fi
                 sleep 0.5
@@ -264,7 +294,7 @@ cmd_api() {
             pid="$(cat "$API_PIDFILE" 2>/dev/null)"
             if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
                 echo "NASA ADS SDO API was not running (stale pidfile removed)."
-                rm -f "$API_PIDFILE"
+                rm -f "$API_PIDFILE" "$API_EXPIRYFILE"
                 exit 0
             fi
 
@@ -284,18 +314,23 @@ cmd_api() {
             # words (e.g. a ps/grep diagnostic), which would kill the wrong
             # process.
             pkill -f "$NASA_ADS_SDO_DIR/venv/bin/uvicorn" 2>/dev/null || true
-            rm -f "$API_PIDFILE"
+            rm -f "$API_PIDFILE" "$API_EXPIRYFILE"
             echo "NASA ADS SDO API stopped (pid $pid)."
             exit 0
             ;;
         status)
             if _api_pid_alive; then
-                local pid
+                local pid time_left
                 pid="$(cat "$API_PIDFILE")"
                 if curl -sf "$API_URL/" >/dev/null 2>&1; then
                     echo "NASA ADS SDO API: running (pid $pid) at $API_URL"
                 else
                     echo "NASA ADS SDO API: process running (pid $pid) but not responding at $API_URL"
+                fi
+                if [[ -f "$API_EXPIRYFILE" ]] && time_left="$(_api_time_left_human "$(cat "$API_EXPIRYFILE")")"; then
+                    echo "  auto-stops in $time_left"
+                else
+                    echo "  no auto-stop scheduled"
                 fi
                 exit 0
             else
@@ -304,10 +339,38 @@ cmd_api() {
             fi
             ;;
         *)
-            echo "Usage: ./tools/extract_plots.sh api {start|stop|status}" >&2
+            echo "Usage: ./tools/extract_plots.sh api {start [--timeout MINUTES]|stop|status}" >&2
             exit 1
             ;;
     esac
+}
+
+_api_arm_watchdog() {
+    local pid="$1" timeout_min="$2"
+
+    if ! [[ "$timeout_min" =~ ^[0-9]+$ ]] || (( timeout_min <= 0 )); then
+        rm -f "$API_EXPIRYFILE"
+        echo "Auto-stop disabled for this session."
+        return
+    fi
+
+    local expiry=$(( $(date +%s) + timeout_min * 60 ))
+    echo "$expiry" > "$API_EXPIRYFILE"
+
+    # Detached watchdog: sleeps for the timeout, then stops the API — but only
+    # if $API_PIDFILE still names the exact instance we armed for. This keeps
+    # a stale watchdog from an earlier `start` from killing a fresh instance
+    # if the user manually stopped and restarted before the timer fired.
+    ( sleep "$(( timeout_min * 60 ))"
+      if [[ "$(cat "$API_PIDFILE" 2>/dev/null)" == "$pid" ]]; then
+          cmd_api stop >>"$API_LOGFILE" 2>&1
+      fi
+    ) </dev/null >/dev/null 2>&1 &
+    disown
+
+    local expiry_human
+    expiry_human="$(date -d "@$expiry" '+%H:%M' 2>/dev/null)"
+    echo "Auto-stop scheduled at ${expiry_human:-+${timeout_min}min} (override with --timeout MINUTES, or --timeout 0 to disable)"
 }
 
 # ---------------------------------------------------------------------------

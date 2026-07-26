@@ -101,6 +101,9 @@ heuristics behind it:
 - [`docs/IMAGE_CAPTION_PIPELINE.md`](docs/IMAGE_CAPTION_PIPELINE.md) — figure ↔ caption matching
 - [`docs/METADATA_EXTRACTION.md`](docs/METADATA_EXTRACTION.md) — LLM metadata extraction
 - [`docs/SDO_QUERY.md`](docs/SDO_QUERY.md) — SDO/VSO querying and submap cropping
+- [`docs/INTERACTIVE_IMAGE_REVIEW.md`](docs/INTERACTIVE_IMAGE_REVIEW.md) — **proposed, not yet
+  built**: a hybrid classifier-highlights/human-confirms review tool to replace unconditional
+  automatic image classification
 
 If you want to understand or modify how a stage works, start with its doc.
 

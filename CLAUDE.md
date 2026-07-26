@@ -44,6 +44,10 @@ Key cross-cutting design points a change is likely to touch:
   Its source lives in-repo under `nasa_ads_sdo/` (FastAPI + SQLite, its own `venv/`, fully isolated
   from the `pytorch_jupyter` conda env) and is managed with
   `./tools/extract_plots.sh api {start,stop,status}` (one-time setup: `cd nasa_ads_sdo && ./setup.sh`).
+  `api start` auto-stops the server after `--timeout MINUTES` (default 120, override via
+  `SDO_API_TIMEOUT_MIN`; `--timeout 0` disables it) via a detached watchdog — it re-checks the
+  pidfile before killing, so a manual stop+restart in the meantime is never clobbered by a stale
+  timer.
 - **Folder naming and the layout are canonical and shared.** `utils/folder_naming.py` builds the
   `YYYY-MM - LastName, F` name from paper metadata (the DB stores dates as `YYYY-MM-00`, and its
   authors field is empty, so the first author is parsed out of the PDF's first-page text), *and*

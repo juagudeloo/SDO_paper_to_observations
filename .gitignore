@@ -12,6 +12,7 @@ nasa_ads_sdo/run_api.sh
 nasa_ads_sdo/run_dev.sh
 nasa_ads_sdo/nohup.out
 nasa_ads_sdo/*.pid
+nasa_ads_sdo/*.expiry
 nasa_ads_sdo/api/database/*.db.backup
 nasa_ads_sdo/api/database/*.db.bak
 nasa_ads_sdo/api/database/*.sqlite.backup

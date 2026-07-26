@@ -209,16 +209,34 @@ def match_image_to_caption(
     captions_by_page: Dict[int, List[Caption]],
 ) -> Tuple[Optional[Caption], str]:
     """
-    Find the caption closest to an image by vertical distance.
+    Find the caption closest to an image, preferring horizontal (column)
+    alignment over vertical distance.
 
     Search strategy:
-      1. Same page — pick the nearest caption by vertical gap.
+      1. Same page — pick the caption with the smallest (x_gap, y_gap, width)
+         tuple, in that priority order (see below).
       2. Adjacent pages (next, then previous) — take the first caption found.
       3. No caption found → return (None, "none").
 
-    The vertical gap between a caption and an image is:
-        min(|caption.y0 - image.y1|, |caption.y1 - image.y0|)
-    This measures the distance from the closest edge of each object.
+    Multi-column layouts (e.g. two side-by-side figures, each with its own
+    caption directly below its own column, both at the same vertical height)
+    cannot be disambiguated by vertical gap alone — a purely-vertical measure
+    is blind to which column an image sits in and can just as easily pick the
+    neighbouring figure's caption. So the match key is a tuple, compared
+    lexicographically:
+      1. x_gap  — 0 if the image's x-range overlaps the caption's x-range,
+         else the horizontal distance to the caption's nearest edge. This is
+         the primary discriminator: an image almost always belongs to the
+         caption in its own column, not a same-height caption in another one.
+      2. y_gap  — min(|caption.y0 - image.y1|, |caption.y1 - image.y0|), the
+         original vertical-gap measure, as a tiebreaker within a column.
+      3. width  — the caption's own bbox width. Caption text blocks can be
+         merged too eagerly (a long caption's continuation lines sometimes
+         pull in a stray block from a neighbouring column, widening its bbox
+         past its column), which would otherwise make a wide caption falsely
+         appear to x-overlap every column. Preferring the narrower candidate
+         when x_gap ties at 0 favours the more specific (correctly single-
+         column) caption over such an accidentally-widened one.
 
     Args:
         img_page: 1-based page number of the image.
@@ -229,16 +247,28 @@ def match_image_to_caption(
         (Caption | None, confidence_string)
         where confidence_string is one of: "same_page", "adjacent_page", "none".
     """
-    def _gap(caption: Caption) -> float:
+    def _x_gap(caption: Caption) -> float:
+        cx0, cx1 = caption.bbox[0], caption.bbox[2]
+        if img_rect.x1 < cx0:
+            return cx0 - img_rect.x1
+        if img_rect.x0 > cx1:
+            return img_rect.x0 - cx1
+        return 0.0
+
+    def _y_gap(caption: Caption) -> float:
         return min(
             abs(caption.bbox[1] - img_rect.y1),  # caption top vs image bottom
             abs(caption.bbox[3] - img_rect.y0),  # caption bottom vs image top
         )
 
+    def _key(caption: Caption) -> tuple:
+        width = caption.bbox[2] - caption.bbox[0]
+        return (_x_gap(caption), _y_gap(caption), width)
+
     # 1. Same-page search
     same_page_captions = captions_by_page.get(img_page, [])
     if same_page_captions:
-        best = min(same_page_captions, key=_gap)
+        best = min(same_page_captions, key=_key)
         return (best, "same_page")
 
     # 2. Adjacent-page search — prefer next page, then previous
@@ -249,6 +279,44 @@ def match_image_to_caption(
 
     # 3. No caption found
     return (None, "none")
+
+
+# ---------------------------------------------------------------------------
+# Event date/time extraction (e.g. section headers like "2.1. Prominence
+# eruption on 2010-06-13 at 00:00" — common in multi-event papers where each
+# section/figure covers one dated event). The caption text usually repeats
+# the bare date ("...evolution of the 2010-06-13 prominence eruption...") but
+# not the time-of-day, which typically only appears once, in the narrative
+# text introducing the event. This is a generic "on DATE at TIME" scan, not
+# tied to any particular section-numbering scheme.
+# ---------------------------------------------------------------------------
+
+_EVENT_DATETIME_RE = re.compile(r"\bon (\d{4}-\d{2}-\d{2}) at (\d{2}:\d{2})\b")
+
+
+def extract_event_datetimes(pdf_path: str) -> Dict[str, str]:
+    """
+    Scan the full document text for "on YYYY-MM-DD at HH:MM" mentions.
+
+    Returns:
+        Dict mapping date string ("2010-06-13") -> time string ("00:00"),
+        for every such mention found. When a date appears more than once with
+        different times, the first occurrence wins (matches reading order).
+    """
+    if not _FITZ_AVAILABLE:
+        raise RuntimeError("PyMuPDF is required. Install with: pip install pymupdf")
+
+    result: Dict[str, str] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_num in range(len(doc)):
+            text = doc[page_num].get_text("text")
+            for m in _EVENT_DATETIME_RE.finditer(text):
+                date, time = m.group(1), m.group(2)
+                result.setdefault(date, time)
+    finally:
+        doc.close()
+    return result
 
 
 # ---------------------------------------------------------------------------

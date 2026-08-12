@@ -41,15 +41,31 @@ highlighter*:
 1. Render each PDF page (PyMuPDF already gives us page images and every embedded image's bbox —
    `utils/pdf_extractor.py` and `extraction_log.json` already capture this for every embedded
    image, not just the ones currently saved).
-2. Run the existing classifier to produce candidate scores/bboxes, and visually highlight them on
-   the rendered page in a small review UI.
+2. Run the existing classifier and show **every embedded image on the page — accepted, rejected,
+   and "too small"-filtered alike — not just the ones it would currently save**, using its verdict
+   (accepted / low-score / rejected / too-small) as a colour-coded hint, not a pre-filter. This is
+   the critical requirement: if the UI only surfaces the classifier's accepted candidates, a human
+   reviewer never even sees the false negatives to correct them.
 3. The user confirms, rejects, or manually adds/adjusts a selection per image, per paper — nothing
    is saved to `output/images/<name>/` without that confirmation.
 
 This keeps the classifier's value (it still does the heavy lifting of proposing candidates, so the
-user isn't manually scanning every embedded object on every page — logos, watermarks, tiny icons,
-etc. don't need review) while eliminating both failure modes above, since nothing reaches the
-canonical output layout without a human looking at it.
+user isn't manually scanning every embedded object with equal attention — logos, watermarks, tiny
+icons, etc. can stay visually de-emphasised) while eliminating both failure modes above, since
+nothing reaches the canonical output layout without a human looking at it, **and nothing is hidden
+from that human either**.
+
+### Concrete precedent: the manual Song rescue this requirement generalizes
+
+Done by hand once already (2026-07-26, see `project_extract_plots` in project memory): 8 real images
+in Song et al. were rejected by the classifier — 2 region-crop magnetograms (`is_solar=False`,
+score 0.15) and 6 small 180×120 HMI sub-panels (`is_solar=False`, score 0.0, `"too_small"` signal).
+Both cases were confirmed real by rendering and visually inspecting them, then rescued via a one-off
+script that bypassed the classifier decision entirely for those specific, individually-verified
+images. **This is exactly the workflow the review tool needs to make a normal, built-in action** —
+today it required writing a throwaway script and manually editing `extraction_log.json`; the tool
+should make "show me this rejected image and let me pull it back in" a first-class, no-code action
+available to any user, not something requiring an engineer to script by hand each time it comes up.
 
 ### Synergy with panel-image association
 
@@ -63,13 +79,20 @@ panel-association problem, rather than building two separate heuristic subsystem
 
 ## The trade-off to size before committing
 
-This shifts pipeline cost from **compute** to **the user's review time per paper**. For a large VLM
+This shifts pipeline cost from **compute** to **human review time per paper**. For a large VLM
 training corpus, page-by-page manual review could become the actual bottleneck — more so than any
 compute or LLM inference cost in the current pipeline. Before building this, get a real sense of the
 target corpus size (reviewing 50 papers is a very different commitment than reviewing 2,000) and
 decide whether the hybrid tool's review burden is sustainable at that scale, or whether some further
 automation (e.g. only surfacing low-confidence classifier decisions for review, auto-accepting
 high-confidence ones) is needed to keep it tractable.
+
+**This will likely need more hands than just the user** (raised 2026-07-26) — if review work is
+eventually split across multiple people (research assistants, collaborators), the tool's per-image
+review speed/ergonomics matters more than if it were only ever used solo: keyboard-driven
+confirm/reject, sensible defaults, minimal clicks per image, and clear visual conventions all become
+more important once the workload is meant to scale across reviewers rather than just be tolerable for
+one person. Worth designing for multi-reviewer use from the start rather than retrofitting it later.
 
 ## Rough shape (not designed in detail yet)
 

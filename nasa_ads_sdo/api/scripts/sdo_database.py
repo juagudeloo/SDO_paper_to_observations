@@ -12,9 +12,12 @@ from modules.database import create_db_and_tables, engine
 from modules.models import SDODocument
 from sqlmodel import SQLModel
 
-token = os.getenv("NASA_ADS_API_KEY")
+token = os.getenv("SCIX_API_KEY")
 
-search_url = "https://api.adsabs.harvard.edu/v1/search/query"
+# NASA ADS's classic search API is superseded by SciX (scixplorer.org), the
+# platform intended to replace it; same query syntax (Solr-based) and
+# Bearer-token auth scheme, just a different host.
+search_url = "https://scixplorer.org/v1/search/query"
 
 
 def main():
@@ -42,7 +45,59 @@ def extract_sdo_documents(pub_year):
     fl_fields = ",".join(api_fields)
 
     encoded_url = urlencode({
-        "q": f"abstract:SDO, year:{pub_year}, body:'solar dynamics observatory'",
+        # "Is this genuinely an SDO paper" is an OR of two signals, so either
+        # is sufficient: (1) bibgroup:SDO — ADS's own librarian-curated
+        # bibliography for the SDO mission; (2) the FULL phrase "solar dynamics
+        # observatory" explicitly named in the ABSTRACT specifically (not body
+        # — see below) — not the loose acronym "SDO" alone, which also matches
+        # papers that only cite SDO in passing, or unrelated fields where the
+        # acronym collides.
+        #
+        # Two things verified live against the real API on 2026-07-27, each
+        # correcting an assumption that silently didn't hold:
+        #
+        # 1. bibgroup:SDO returns ZERO results — unlike bibgroup:HST, which
+        #    works exactly as ADS's own docs describe, so this specific
+        #    bibgroup is unpopulated/inactive in the live index, not a syntax
+        #    problem. Kept anyway (costs nothing in an OR; would start
+        #    contributing for free if ADS/SciX ever populates it), but the
+        #    phrase match is what's actually carrying this filter today.
+        #
+        # 2. Phrase quoting MUST use double quotes (abstract:"...") — ADS's
+        #    documented "Advanced Search Syntax" uses double quotes for phrase
+        #    search; single quotes (the form originally used here) do NOT
+        #    enforce a phrase match and instead let each word match
+        #    independently (with synonym expansion — e.g. "solar"~"sun").
+        #    Confirmed by a concrete false positive: with single quotes, a
+        #    paper on Betelgeuse convection matched even though its abstract
+        #    never contains the phrase "solar dynamics observatory" at all —
+        #    it separately mentions "sun" (synonym of "solar") and "the
+        #    Observatoire du Pic du Midi" (loosely matching "observatory").
+        #
+        # ALSO verified: requiring the phrase in `body` (full text) instead of
+        # just `abstract` roughly triples matches per year and reintroduces
+        # clear false positives at the top (e.g. papers on Be-star mass loss,
+        # hypervelocity stars) — full-text citations of SDO as a comparison
+        # point are common and don't mean the paper is about SDO. Deliberately
+        # NOT included; abstract-only is the precise signal.
+        #
+        # Everything else is a mandatory (AND) quality/domain filter, regardless
+        # of which of the above two signals qualified the paper:
+        # - bibstem:A&A       — Astronomy & Astrophysics journal: open access
+        #                       (reliable PDF downloads) and empirically the
+        #                       best signal-to-noise source for this pipeline
+        #                       so far. Widen to other peer-reviewed solar
+        #                       physics journals later if A&A alone doesn't
+        #                       give enough coverage.
+        # - database:astronomy — excludes physics/other ADS databases outright,
+        #                       rather than relying on text alone.
+        # - doctype:article   — excludes meeting abstracts, errata, conference
+        #                       proceedings, press releases, etc.
+        # - property:refereed (below, in fq) — peer-reviewed only.
+        "q": (
+            '(bibgroup:SDO OR abstract:"solar dynamics observatory"), '
+            f"year:{pub_year}, bibstem:A&A, database:astronomy, doctype:article"
+        ),
         "fq": "property:refereed",
         "sort": "date desc",
         "fl": fl_fields,

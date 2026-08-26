@@ -55,10 +55,10 @@ def read_documents(
             "doi": doc.doi,
             "bibcode": doc.bibcode,
             "citation_count": doc.citation_count,
-            "ads_url": f"https://ui.adsabs.harvard.edu/abs/{doc.bibcode}" if doc.bibcode else None
+            "ads_url": f"https://scixplorer.org/abs/{doc.bibcode}" if doc.bibcode else None
         }
         public_documents.append(SDODocumentPublic(**doc_data))
-    
+
     return public_documents
 
 @app.get("/documents/{document_id}", response_model=SDODocumentPublic)
@@ -78,7 +78,7 @@ def read_document(document_id: int, session: Session = Depends(get_session)):
         "doi": document.doi,
         "bibcode": document.bibcode,
         "citation_count": document.citation_count,
-        "ads_url": f"https://ui.adsabs.harvard.edu/abs/{document.bibcode}" if document.bibcode else None
+        "ads_url": f"https://scixplorer.org/abs/{document.bibcode}" if document.bibcode else None
     }
     
     return SDODocumentPublic(**doc_data)
@@ -109,7 +109,7 @@ def search_documents(
             "doi": doc.doi,
             "bibcode": doc.bibcode,
             "citation_count": doc.citation_count,
-            "ads_url": f"https://ui.adsabs.harvard.edu/abs/{doc.bibcode}" if doc.bibcode else None
+            "ads_url": f"https://scixplorer.org/abs/{doc.bibcode}" if doc.bibcode else None
         }
         public_documents.append(SDODocumentPublic(**doc_data))
     
@@ -133,12 +133,12 @@ async def download_pdf_auto(
     if source:
         if source not in ["arxiv", "publisher"]:
             raise HTTPException(status_code=400, detail="Source must be 'arxiv' or 'publisher'")
-        sources = [(source, f"https://ui.adsabs.harvard.edu/link_gateway/{document.bibcode}/{'EPRINT_PDF' if source == 'arxiv' else 'PUB_PDF'}")]
+        sources = [(source, f"https://scixplorer.org/link_gateway/{document.bibcode}/{'EPRINT_PDF' if source == 'arxiv' else 'PUB_PDF'}")]
     else:
         # Try arXiv first, then publisher
         sources = [
-            ("arxiv", f"https://ui.adsabs.harvard.edu/link_gateway/{document.bibcode}/EPRINT_PDF"),
-            ("publisher", f"https://ui.adsabs.harvard.edu/link_gateway/{document.bibcode}/PUB_PDF")
+            ("arxiv", f"https://scixplorer.org/link_gateway/{document.bibcode}/EPRINT_PDF"),
+            ("publisher", f"https://scixplorer.org/link_gateway/{document.bibcode}/PUB_PDF")
         ]
     
     # Set up browser-like headers to avoid blocking
@@ -212,10 +212,10 @@ async def download_pdf(
     
     # Determine the correct ADS link gateway endpoint
     if pdf_type == "arxiv":
-        ads_url = f"https://ui.adsabs.harvard.edu/link_gateway/{document.bibcode}/EPRINT_PDF"
+        ads_url = f"https://scixplorer.org/link_gateway/{document.bibcode}/EPRINT_PDF"
         filename = f"{document.bibcode}_arxiv.pdf"
     else:  # publisher
-        ads_url = f"https://ui.adsabs.harvard.edu/link_gateway/{document.bibcode}/PUB_PDF"
+        ads_url = f"https://scixplorer.org/link_gateway/{document.bibcode}/PUB_PDF"
         filename = f"{document.bibcode}_publisher.pdf"
     
     try:
@@ -303,10 +303,10 @@ def get_ads_links(document_id: int, session: Session = Depends(get_session)):
     
     ads_links = {
         "bibcode": document.bibcode,
-        "ads_url": f"https://ui.adsabs.harvard.edu/abs/{document.bibcode}",
+        "ads_url": f"https://scixplorer.org/abs/{document.bibcode}",
         "pdf_links": {
-            "arxiv_pdf_direct": f"https://ui.adsabs.harvard.edu/link_gateway/{document.bibcode}/EPRINT_PDF",
-            "publisher_pdf_direct": f"https://ui.adsabs.harvard.edu/link_gateway/{document.bibcode}/PUB_PDF"
+            "arxiv_pdf_direct": f"https://scixplorer.org/link_gateway/{document.bibcode}/EPRINT_PDF",
+            "publisher_pdf_direct": f"https://scixplorer.org/link_gateway/{document.bibcode}/PUB_PDF"
         },
         "api_download_links": {
             "download_pdf_auto": f"{base_url}/documents/{document_id}/download-pdf",
@@ -314,13 +314,13 @@ def get_ads_links(document_id: int, session: Session = Depends(get_session)):
             "download_publisher_pdf": f"{base_url}/documents/{document_id}/download-pdf/publisher"
         },
         "export_links": {
-            "bibtex": f"https://ui.adsabs.harvard.edu/abs/{document.bibcode}/exportcitation",
-            "ads_format": f"https://ui.adsabs.harvard.edu/abs/{document.bibcode}/exportcitation"
+            "bibtex": f"https://scixplorer.org/abs/{document.bibcode}/exportcitation",
+            "ads_format": f"https://scixplorer.org/abs/{document.bibcode}/exportcitation"
         },
         "related_links": {
-            "references": f"https://ui.adsabs.harvard.edu/abs/{document.bibcode}/references",
-            "citations": f"https://ui.adsabs.harvard.edu/abs/{document.bibcode}/citations",
-            "similar": f"https://ui.adsabs.harvard.edu/abs/{document.bibcode}/similar"
+            "references": f"https://scixplorer.org/abs/{document.bibcode}/references",
+            "citations": f"https://scixplorer.org/abs/{document.bibcode}/citations",
+            "similar": f"https://scixplorer.org/abs/{document.bibcode}/similar"
         }
     }
     

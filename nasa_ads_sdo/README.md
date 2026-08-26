@@ -24,10 +24,10 @@ curl -o paper_publisher.pdf "http://localhost:8000/documents/1366704/download-pd
 ```bash
 curl "http://localhost:8000/stats/"
 ``` document
-- 📄 **PDF Download**: Direct PDF download endpoints via NASA ADS link gateway
+- 📄 **PDF Download**: Direct PDF download endpoints via SciX's link gateway
 - 🔍 **Search Functionality**: Search documents by title, abstract, or publication year SDO Database & API
 
-Based on the [NASA ADS API](https://ui.adsabs.harvard.edu/help/api/), this repository contains the necessary code to obtain all the published papers that make use of SDO (Solar Dynamics Observatory) data for solar atmospheric analysis, along with a FastAPI web service to access this data.
+Based on [SciX](https://scixplorer.org/help/api/) (scixplorer.org — the platform superseding NASA ADS's classic search API), this repository contains the necessary code to obtain all the published papers that make use of SDO (Solar Dynamics Observatory) data for solar atmospheric analysis, along with a FastAPI web service to access this data. Papers are selected by the full phrase "solar dynamics observatory" required in the abstract (ADS's own `bibgroup:SDO` bibliography is OR'd in too, but currently returns zero live results), restricted to refereed, astronomy-database journal articles in Astronomy & Astrophysics — about 503 papers for 2010–2024 (see `api/scripts/sdo_database.py`).
 
 ## Features
 
@@ -191,7 +191,7 @@ curl "http://localhost:8000/stats/"
   "doi": "10.1051/0004-6361/200912904",
   "bibcode": "2010A&A...518A..49D",
   "citation_count": 27,
-  "ads_url": "https://ui.adsabs.harvard.edu/abs/2010A&A...518A..49D"
+  "ads_url": "https://scixplorer.org/abs/2010A&A...518A..49D"
 }
 ```
 
@@ -240,8 +240,8 @@ API_HOST=0.0.0.0
 API_PORT=8000
 DEBUG=False
 
-# NASA ADS API Key (for future data collection)
-NASA_ADS_API_KEY=your_api_key_here
+# SciX API Key (for database (re)population — see api/scripts/sdo_database.py)
+SCIX_API_KEY=your_api_key_here
 
 # Database URL (optional, defaults to SQLite)
 DATABASE_URL=sqlite:///api/database/sdo_papers_2010_2024.db

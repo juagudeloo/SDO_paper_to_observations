@@ -20,8 +20,8 @@ DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 # Database Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", None)
 
-# NASA ADS API Configuration
-NASA_ADS_API_KEY = os.getenv("NASA_ADS_API_KEY", None)
+# SciX (successor to the NASA ADS search API) configuration
+SCIX_API_KEY = os.getenv("SCIX_API_KEY", None)
 
 # Pagination defaults
 DEFAULT_PAGE_SIZE = 100
